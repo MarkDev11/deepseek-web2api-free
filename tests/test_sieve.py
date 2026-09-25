@@ -103,3 +103,29 @@ def test_split_safe_empty_string():
     # Edge case: chunk is empty / whitespace.
     out = _collect_text(s, [""])
     assert out == ""
+
+
+def _collect(sieve, chunks):
+    events = [e for ch in chunks for e in sieve.feed(ch)] + sieve.flush()
+    text = "".join(e.data for e in events if e.type == "text")
+    calls = [c for e in events if e.type == "tool_calls" for c in e.data]
+    return text, calls
+
+
+def test_tokenized_dsml_tool_call_leaks_no_text():
+    # DeepSeek streams tags in small pieces; "<" followed by "|" used to
+    # emit the "<" as text (and then leak the closing tag).
+    from tool_dsml import parse_dsml_tool_calls
+    s = StreamSieve(parse_fn=lambda t: parse_dsml_tool_calls(t, ["get_weather"]))
+    chunks = ["<", "|", "DSML", "|", "tool", "_calls", ">\n",
+              "<", "|", "DSML", "|", 'invoke name="get_weather">',
+              '<|DSML|parameter name="city" string="true">Berlin</|DSML|parameter>',
+              "</|DSML|invoke>\n", "</", "|DSML|", "tool_calls>"]
+    text, calls = _collect(s, chunks)
+    assert text == ""
+    assert len(calls) == 1
+
+
+def test_lone_lt_and_pipe_in_plain_text_pass_through():
+    s = StreamSieve(parse_fn=_parse_fn_stub)
+    assert _collect_text(s, ["a < b", " | c"]) == "a < b | c"

@@ -208,25 +208,16 @@ class StreamSieve:
         """
         if not text:
             return "", ""
-        last_lt = text.rfind("<")
-        last_pipe = text.rfind("|")
-        last_special = last_lt if last_lt >= last_pipe else last_pipe
-        if last_special == -1:
-            # No special characters at all: nothing can ever start a tag.
-            return text, ""
-        tail = text[last_special:]
-        # The empty-tail edge case: an empty `tail` is always a prefix of
-        # any string, so we'd recurse forever. The check `last_special != -1`
-        # already guarantees tail has at least one character, so this branch
-        # is unreachable — kept here as a safety net.
-        if not tail:
-            return text, ""
-        for tag in self._TOOL_STARTS:
-            if tag.startswith(tail) or tail == tag[:len(tail)]:
-                return text[:last_special], tail
-        for prefix in self._TOOL_PREFIXES:
-            if prefix.startswith(tail) or (len(tail) <= len(prefix) and tail == prefix[:len(tail)]):
-                return text[:last_special], tail
+        # Hold from the EARLIEST '<' or '|' whose tail can still grow into a
+        # tag. Looking only at the last special character breaks when the
+        # model streams "<|DSML|tool_calls>" in small pieces: with "<|" held,
+        # the last special char is '|', so the '<' was emitted as text and the
+        # capture started at "|DSML|...". The client then saw a stray "<"
+        # before every streamed tool call, plus a leaked closing tag.
+        cands = (*self._TOOL_STARTS, *self._TOOL_PREFIXES)
+        for i in range(max(0, len(text) - max(map(len, cands))), len(text)):
+            if text[i] in "<|" and any(c.startswith(text[i:]) for c in cands):
+                return text[:i], text[i:]
         return text, ""
 
     def _try_finish_capture(self):
