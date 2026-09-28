@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/index.py": {
+      "runtime": "python3.12",
+      "maxDuration": 60
+    }
+  },
+  "buildCommand": "cd webui-new && npm ci && npm run build",
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
+  "env": {
+    "ACCOUNT_STORE_PATH": "/tmp/accounts.json",
+    "LOG_FORMAT": "json"
+  }
+}

@@ -1,0 +1,20 @@
+# Vercel deploy ignore — keep the serverless bundle lean.
+# NOTE: webui-new/dist is NOT listed here on purpose: it is generated
+# by the buildCommand (npm run build) and must be included in the output.
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+data/
+.env
+server_test.log
+.DS_Store
+.idea/
+.vscode/
+tests/
+docs/
+scripts/
+.github/

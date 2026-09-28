@@ -199,7 +199,11 @@ async def _add_security_headers(request: Request, call_next):
 pool = get_pool()
 
 # Start the rolling history sampler (v3 webui dashboard charts).
-start_sampler(get_stats())
+# Skipped on Vercel serverless (VERCEL=1): background threads don't survive
+# across invocations and only add cold-start cost; /admin/api/history
+# simply returns fewer points there.
+if os.environ.get("VERCEL") != "1":
+    start_sampler(get_stats())
 
 if pool.count() == 0:
     log.warning(
