@@ -67,7 +67,12 @@ MODE = os.environ.get("MODE", "auto").strip().lower()
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
 SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
 HOST = os.environ.get("HOST", "127.0.0.1").strip()
-PORT = int(os.environ.get("PORT", "8080"))
+try:
+    PORT = int(os.environ.get("PORT") or "8080")
+except ValueError:
+    # Vercel injects PORT as an empty string in the serverless runtime;
+    # the value is unused there (platform owns the socket).
+    PORT = 8080
 ALLOW_UNAUTHENTICATED_API = os.environ.get("ALLOW_UNAUTHENTICATED_API", "false").strip().lower() in {"1", "true", "yes", "on"}
 ALLOW_INSECURE_PUBLIC_DEFAULTS = os.environ.get("ALLOW_INSECURE_PUBLIC_DEFAULTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
