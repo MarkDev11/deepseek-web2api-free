@@ -6,7 +6,6 @@
     }
   },
   "buildCommand": "cd webui-new && npm ci && npm run build",
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
   "env": {
     "ACCOUNT_STORE_PATH": "/tmp/accounts.json",
     "LOG_FORMAT": "json"
