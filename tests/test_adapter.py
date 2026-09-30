@@ -240,6 +240,39 @@ class TestChatStream:
             list(ad.chat_stream("sess-1", "prompt"))
 
 
+# ── fragment-switch initial content (head-truncation guard) ──
+
+_THINK_THEN_RESPONSE_SSE = (
+    "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n"
+    "data: {\"v\":{\"response\":{\"message_id\":2,\"fragments\":"
+    "[{\"id\":2,\"type\":\"THINK\",\"content\":\"\"}]}}}\n\n"
+    "data: {\"p\":\"response/fragments/-1/content\",\"o\":\"APPEND\",\"v\":\"...\"}\n\n"
+    "data: {\"p\":\"response/fragments\",\"o\":\"APPEND\",\"v\":"
+    "[{\"id\":3,\"type\":\"RESPONSE\",\"content\":\"Jak\"}]}\n\n"
+    "data: {\"p\":\"response/fragments/-1/content\",\"o\":\"APPEND\",\"v\":\"arta\"}\n\n"
+    "data: {\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}\n\n"
+)
+
+
+class TestFragmentSwitchContent:
+    def test_nonstream_keeps_switch_frame_content(self, monkeypatch):
+        ad = _adapter()
+        monkeypatch.setattr(ad, "_send_completion",
+                            lambda *a, **k: _FakeResp(_THINK_THEN_RESPONSE_SSE))
+        content, thinking = ad.chat("sess-1", "prompt", thinking_enabled=True)
+        assert content == "Jakarta"
+        assert thinking == "..."
+
+    def test_stream_keeps_switch_frame_content(self, monkeypatch):
+        ad = _adapter()
+        resp = _FakeStreamResp(_THINK_THEN_RESPONSE_SSE)
+        monkeypatch.setattr(ad, "_pow_headers", lambda *a, **k: {})
+        monkeypatch.setattr(ad, "_client", type("C", (), {"post": lambda *a, **k: resp})())
+        texts = [t for t in ad.chat_stream("sess-1", "prompt", thinking_enabled=True)
+                 if isinstance(t, str)]
+        assert "".join(texts) == "Jakarta"
+
+
 # ── hif signature headers ─────────────────────────────────────
 
 class _FakeHifResp:

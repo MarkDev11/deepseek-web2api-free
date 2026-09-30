@@ -723,7 +723,10 @@ class DeepSeekAdapter:
                     content_parts.append(v)
                 continue
 
-            # Expert mode: fragment switch
+            # Expert mode: fragment switch. The switch frame may already
+            # carry initial content for the new fragment (v[0].content) —
+            # dropping it truncates the head of the answer (e.g. quick +
+            # thinking replies arriving as "arta" instead of "Jakarta").
             if p == "response/fragments" and o == "APPEND":
                 if isinstance(v, list) and v:
                     new_type = v[0].get('type', '')
@@ -731,6 +734,10 @@ class DeepSeekAdapter:
                         frag_type = 'content'
                     elif new_type == 'THINK':
                         frag_type = 'thinking'
+                    fc = v[0].get('content', '')
+                    if fc:
+                        (thinking_parts if frag_type == 'thinking'
+                         else content_parts).append(fc)
                 continue
 
             # Normal mode
@@ -984,7 +991,9 @@ class DeepSeekAdapter:
                             yield v
                     continue
 
-                # Fragment switch (expert mode)
+                # Fragment switch (expert mode). Same head-truncation
+                # hazard as the non-streaming parser: emit v[0].content
+                # instead of dropping it.
                 if p == "response/fragments" and o == "APPEND":
                     if isinstance(v, list) and v:
                         new_type = v[0].get('type', '')
@@ -992,6 +1001,12 @@ class DeepSeekAdapter:
                             frag_type = 'content'
                         elif new_type == 'THINK':
                             frag_type = 'thinking'
+                        fc = v[0].get('content', '')
+                        if fc:
+                            if frag_type == 'thinking':
+                                yield {"__type": "thinking", "content": fc}
+                            else:
+                                yield fc
                     continue
 
                 # Normal mode content
