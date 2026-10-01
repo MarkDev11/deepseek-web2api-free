@@ -1,6 +1,8 @@
 """
 Admin API — authentication, statistics tracking, account pool management.
 """
+import hashlib
+import hmac
 import os
 import secrets
 import threading
@@ -32,6 +34,35 @@ def _generate_token() -> str:
     return secrets.token_hex(32)
 
 
+# ── Stateless signed tokens (serverless-safe) ────────────────
+# `_tokens` above is process-local memory: on serverless platforms
+# (Vercel) the login request and the next dashboard request can land
+# on different instances, so a token issued by instance A is unknown
+# to instance B → 401 → webui bounces back to /login even with the
+# right password. When ADMIN_TOKEN_SECRET is set, issued tokens are
+# `<rand>.<hmac-sha256(rand)>` and verify on ANY instance without
+# shared state. Unset = previous in-memory-only behaviour.
+_TOKEN_SECRET = os.environ.get("ADMIN_TOKEN_SECRET", "").strip().encode()
+
+
+def _sign_token(rand: str) -> str:
+    sig = hmac.new(_TOKEN_SECRET, rand.encode(), hashlib.sha256).hexdigest()
+    return f"{rand}.{sig}"
+
+
+def _verify_signed_token(token: str) -> bool:
+    if not _TOKEN_SECRET:
+        return False
+    try:
+        rand, sig = token.rsplit(".", 1)
+    except ValueError:
+        return False
+    if not rand or not sig:
+        return False
+    expected = hmac.new(_TOKEN_SECRET, rand.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
 def is_admin_password_weak() -> bool:
     """True if the configured admin password is the default or otherwise weak.
 
@@ -44,6 +75,9 @@ def is_admin_password_weak() -> bool:
 def _verify_token(token: str) -> bool:
     if not token:
         return False
+    # Stateless path first: valid on every instance, no shared state.
+    if _verify_signed_token(token):
+        return True
     # Constant-time membership: compare against every stored token. The set is
     # small (one entry per active admin session) so the cost is negligible.
     snapshot = tuple(_tokens)
@@ -245,6 +279,8 @@ async def login(req: LoginRequest, request: Request):
         _login_clear(ip)
         token = _generate_token()
         _tokens.add(token)
+        if _TOKEN_SECRET:
+            token = _sign_token(token)
         log.info("admin_login_success", extra={"ip": ip})
         return {"token": token}
     _login_record_failure(ip)
@@ -259,6 +295,9 @@ async def logout(request: Request):
     token = auth.removeprefix("Bearer ").strip()
     if token:
         _tokens.discard(token)
+        # Signed tokens: also drop the unsigned rand part so logout
+        # revokes the session on this instance at least.
+        _tokens.discard(token.split(".", 1)[0])
     return {"ok": True}
 
 
