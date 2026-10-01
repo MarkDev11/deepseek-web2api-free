@@ -273,6 +273,32 @@ class TestFragmentSwitchContent:
         assert "".join(texts) == "Jakarta"
 
 
+class _FakeJsonResp(_FakeResp):
+    """_FakeResp with a .json() body (challenge endpoint)."""
+
+    def json(self):
+        import json as _json
+        return _json.loads(self.text)
+
+
+class TestChallengeRejection:
+    def test_null_data_raises_clear_invalid_token_error(self, monkeypatch):
+        """Expired credentials: 200 + {"code":40003,...,"data":null} must
+        surface the real cause, not crash with AttributeError."""
+        ad = _adapter()
+        resp = _FakeJsonResp('{"code":40003,"msg":"Authorization Failed (invalid token)","data":null}')
+        monkeypatch.setattr(ad, "_client", type("C", (), {"post": lambda *a, **k: resp})())
+        with pytest.raises(RuntimeError, match="40003"):
+            ad._get_challenge()
+
+    def test_non_dict_body_raises_empty_error(self, monkeypatch):
+        ad = _adapter()
+        resp = _FakeJsonResp("null")
+        monkeypatch.setattr(ad, "_client", type("C", (), {"post": lambda *a, **k: resp})())
+        with pytest.raises(UpstreamEmptyError):
+            ad._get_challenge()
+
+
 # ── hif signature headers ─────────────────────────────────────
 
 class _FakeHifResp:

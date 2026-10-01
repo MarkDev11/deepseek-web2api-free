@@ -394,12 +394,23 @@ class DeepSeekAdapter:
             raise WAFChallengeError(kind, resp.status_code, resp.text)
         resp.raise_for_status()
         data = resp.json()
-        try:
-            return data["data"]["biz_data"]["challenge"]
-        except (KeyError, TypeError) as e:
+        # Expired/rejected credentials arrive as HTTP 200 with
+        # {"code":40003,"msg":"Authorization Failed (invalid token)","data":null}.
+        # Guard every level: data itself (or data.data) may be None, and the
+        # old code crashed with AttributeError while building the error
+        # message, masking the real 40003 cause.
+        if not isinstance(data, dict):
+            raise UpstreamEmptyError(
+                "challenge endpoint returned a non-JSON body")
+        inner = data.get("data")
+        biz = inner.get("biz_data") if isinstance(inner, dict) else None
+        challenge = biz.get("challenge") if isinstance(biz, dict) else None
+        if not challenge:
             raise RuntimeError(
-                f"Unexpected challenge response structure: {data.get('code', 'unknown')} - {data.get('msg', str(e))}"
+                f"challenge rejected: {data.get('code', 'unknown')} - "
+                f"{data.get('msg', 'refresh DEEPSEEK_TOKEN/COOKIES')}"
             )
+        return challenge
 
     def _solve(self, challenge_data: dict) -> str:
         nonce = self.solver.solve(
