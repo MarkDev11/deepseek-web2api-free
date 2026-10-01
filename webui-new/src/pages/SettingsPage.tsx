@@ -5,8 +5,8 @@ export default function SettingsPage() {
   return (
     <div className="space-y-6 animate-fade-in">
       <PageHeader
-        title="设置"
-        description="查看当前生效的运行时配置（只读）"
+        title="Settings"
+        description="View the effective runtime configuration (read-only)"
       />
       <EnvPreview />
     </div>

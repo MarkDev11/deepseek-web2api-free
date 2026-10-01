@@ -26,7 +26,7 @@ export function ModelSelector({ value, onChange, labels }: Props) {
   if (error) {
     return (
       <div className="text-xs text-destructive">
-        无法加载模型列表（需要先在 <code className="font-mono">.env</code> 设置 <code className="font-mono">API_KEYS</code>）:{' '}
+        Failed to load model list (set <code className="font-mono">API_KEYS</code> in <code className="font-mono">.env</code> first):{' '}
         {error instanceof ApiCallError ? error.message : String(error)}
       </div>
     )
@@ -37,7 +37,7 @@ export function ModelSelector({ value, onChange, labels }: Props) {
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger>
-        <SelectValue placeholder="选择模型…" />
+        <SelectValue placeholder="Select a model…" />
       </SelectTrigger>
       <SelectContent>
         {models.map((m) => (
