@@ -261,8 +261,17 @@ class AccountPool:
             self._append_loaded(acct)
 
     def _ensure_store_dir(self):
+        """Prepare the file store directory, if the file store is used.
+
+        On serverless this is the platform temp dir: it already exists and
+        refuses chmod with EPERM even for the process' own files, so the
+        permission tightening is best-effort. Aborting here would fail the
+        save before the authoritative backend is even reached.
+        """
+        if not credential_store.uses_file_store():
+            return
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(self._store_path.parent, 0o700)
+        credential_store.quiet_chmod(str(self._store_path.parent), 0o700)
 
     def _save_persisted_accounts_locked(self):
         self._ensure_store_dir()

@@ -2,12 +2,16 @@
 
 Backend is chosen by environment: when both `KV_REST_API_URL` and
 `KV_REST_API_TOKEN` are present (Vercel KV injects them into the runtime),
-KV is authoritative and uses the Upstash-compatible REST protocol. The JSON
-file stays as a best-effort mirror, which
+KV is authoritative and uses the Upstash-compatible REST protocol. A JSON file
+sits alongside it as a mirror, which
 
 * keeps local development working with no extra services, and
 * gives a serverless instance something to fall back to if KV is briefly
   unreachable.
+
+The mirror is optional (`ACCOUNT_STORE_MIRROR=0`): on serverless the only
+writable directory is the platform's temp dir, which never survives a cold
+start, so there the mirror is an extra fsync per save that is never read back.
 
 This exists because a Vercel container's filesystem is ephemeral: /tmp dies
 with the instance, so a refreshed token written there disappears on the next
@@ -64,6 +68,22 @@ def kv_key() -> str:
 def backend() -> str:
     """"vercel_kv" when KV is configured, otherwise "file"."""
     return "vercel_kv" if _kv_config() else "file"
+
+
+def _mirror_enabled() -> bool:
+    """Whether the JSON file mirrors the KV document."""
+    return (os.environ.get("ACCOUNT_STORE_MIRROR", "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def uses_file_store() -> bool:
+    """Whether `path` participates in reads/writes.
+
+    True when the file is the store (no KV) or when mirroring is enabled;
+    False means the store is KV-only and the local path is never touched.
+    """
+    return _kv_config() is None or _mirror_enabled()
 
 
 def _command(cfg: tuple, args: list) -> object:
@@ -134,6 +154,8 @@ def read_store(path: Path) -> str | None:
                 log.warning("kv_value_unparseable", extra={"key": kv_key()})
             # Empty KV: fall through to the file mirror so a store created
             # before KV was configured is not silently lost.
+        if not _mirror_enabled():
+            return None
     return _read_file(path)
 
 
@@ -151,20 +173,21 @@ def write_store(path: Path, payload: str) -> None:
                 raise CredentialStoreError(f"kv set returned {result!r}")
         except Exception as e:
             error = e
-    try:
-        _write_file(path, payload)
-    except Exception as e:
-        if cfg and error is None:
-            # KV took it; the mirror is only a convenience.
-            log.warning("account_store_mirror_write_failed",
-                        extra={"path": str(path), "error": str(e)})
-        elif not cfg:
-            raise CredentialStoreError(f"file store write failed: {e}") from e
+    if not cfg or _mirror_enabled():
+        try:
+            _write_file(path, payload)
+        except Exception as e:
+            if cfg and error is None:
+                # KV took it; the mirror is only a convenience.
+                log.warning("account_store_mirror_write_failed",
+                            extra={"path": str(path), "error": str(e)})
+            elif not cfg:
+                raise CredentialStoreError(f"file store write failed: {e}") from e
     if error is not None:
         raise CredentialStoreError(f"kv write failed: {error}") from error
 
 
-def _quiet_chmod(target: str, mode: int) -> None:
+def quiet_chmod(target: str, mode: int) -> None:
     """Tighten permissions when the filesystem allows it.
 
     Serverless filesystems may reject chmod on their temp directory with
@@ -184,7 +207,7 @@ def _write_file(path: Path, payload: str) -> None:
     import tempfile
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    _quiet_chmod(str(path.parent), 0o700)
+    quiet_chmod(str(path.parent), 0o700)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True,
     )
@@ -193,9 +216,9 @@ def _write_file(path: Path, payload: str) -> None:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
-        _quiet_chmod(tmp_name, 0o600)
+        quiet_chmod(tmp_name, 0o600)
         os.replace(tmp_name, path)
-        _quiet_chmod(str(path), 0o600)
+        quiet_chmod(str(path), 0o600)
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
@@ -203,4 +226,10 @@ def _write_file(path: Path, payload: str) -> None:
 
 def describe() -> dict:
     """Small, secret-free summary for the admin panel."""
-    return {"backend": backend(), "key": kv_key() if _kv_config() else ""}
+    return {
+        "backend": backend(),
+        "key": kv_key() if _kv_config() else "",
+        # "store" = the file is the store, "mirror" = copy of KV, "off" = KV only.
+        "file_store": "store" if not _kv_config()
+        else ("mirror" if _mirror_enabled() else "off"),
+    }

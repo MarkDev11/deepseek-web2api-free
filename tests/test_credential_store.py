@@ -56,7 +56,7 @@ def kv(monkeypatch, tmp_path):
 class TestBackendSelection:
     def test_file_backend_without_kv_env(self, no_kv, tmp_path):
         assert cs.backend() == "file"
-        assert cs.describe() == {"backend": "file", "key": ""}
+        assert cs.describe() == {"backend": "file", "key": "", "file_store": "store"}
 
     def test_partial_kv_config_stays_on_file(self, monkeypatch, no_kv):
         monkeypatch.setenv("KV_REST_API_URL", "https://kv.example.com")
@@ -234,3 +234,41 @@ class TestFileMirrorPermissions:
         path = tmp_path / "nested" / "accounts.json"
         cs.write_store(path, json.dumps({"accounts": []}))
         assert json.loads(path.read_text(encoding="utf-8")) == {"accounts": []}
+
+
+class TestFileMirrorSwitch:
+    """ACCOUNT_STORE_MIRROR=0 keeps a save entirely off the temp directory."""
+
+    KV = (("KV_REST_API_URL", "https://db.example.com"), ("KV_REST_API_TOKEN", "tok"))
+
+    def _kv(self, monkeypatch, get_result=None):
+        for name, value in self.KV:
+            monkeypatch.setenv(name, value)
+        monkeypatch.setenv("ACCOUNT_STORE_MIRROR", "0")
+        monkeypatch.setattr(
+            cs, "_command",
+            lambda cfg, args: ("OK" if args[0] == "set" else get_result),
+        )
+
+    def test_mirror_off_skips_the_file_write(self, tmp_path, monkeypatch):
+        self._kv(monkeypatch)
+        monkeypatch.setattr(cs, "_write_file",
+                            lambda *a: (_ for _ in ()).throw(AssertionError("file touched")))
+        cs.write_store(tmp_path / "accounts.json", "{}")
+
+    def test_mirror_off_does_not_read_the_file(self, tmp_path, monkeypatch):
+        self._kv(monkeypatch)
+        monkeypatch.setattr(cs, "_read_file",
+                            lambda *a: (_ for _ in ()).throw(AssertionError("file touched")))
+        assert cs.read_store(tmp_path / "accounts.json") is None
+
+    def test_file_is_still_written_when_it_is_the_only_store(self, tmp_path, monkeypatch, no_kv):
+        monkeypatch.setenv("ACCOUNT_STORE_MIRROR", "0")
+        path = tmp_path / "accounts.json"
+        cs.write_store(path, '{"accounts": []}')
+        assert path.exists()
+
+    def test_describe_reports_an_off_mirror(self, monkeypatch):
+        self._kv(monkeypatch)
+        assert cs.describe() == {"backend": "vercel_kv", "key": cs.DEFAULT_KV_KEY,
+                                 "file_store": "off"}

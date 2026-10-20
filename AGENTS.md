@@ -45,6 +45,8 @@
 
 **DeepSeek 账号 token 不是 JWT（2026-10-20 实测）**：从浏览器 `localStorage.userToken`（形如 `{"value":"…","__version":"0"}`）取到的 token 是 **64 字符不透明串**（含 `+` `/`），与请求头 `authorization: Bearer …` 逐字一致；`settingsJwt` 是加密的设置 blob，不是凭证。因此 `credentials.token_expires_at` 恒为 `None`：WebUI 的 Token expiry 徽章显示 `—`，**主动刷新不会触发**，实际生效的是被动刷新（HTTP 200 + `code 40003`）和手动 Refresh。取凭证还要注意 cookie：`ds_session_id` 是 HttpOnly，`document.cookie` 看不到，必须从 Network 请求头复制。
 
+**镜像文件是可选的，以及「保存账号失败」的真正根因（2026-10-20 实测）**：WebUI 添加账号报 `Operation not permitted: '/tmp'`（EPERM）。不是权限配置问题，而是**两处没有保护的 `os.chmod`**：`account_pool._ensure_store_dir()` 对 `/tmp` **目录本身** chmod，`credential_store._write_file()` 对写入中的临时文件 chmod。Vercel 的 `/tmp` 对本进程刚创建的文件也拒绝 chmod，于是**账号保存在到达权威后端（KV）之前就已经抛出**——表现正是「KV 里永远没有键 + 文件也写不进去」。权限位是加分项而不是前提，两处现在统一走 `credential_store.quiet_chmod()`。同时新增 `ACCOUNT_STORE_MIRROR`（默认 `1` 保持原行为）：设为 `0` 时 KV 是唯一存储，读写完全不碰本地路径（`write_store`/`read_store` 跳过文件，`_ensure_store_dir()` 用 `credential_store.uses_file_store()` 直接返回），生产环境已设 `ACCOUNT_STORE_MIRROR=0`；`/admin/api/env` 的 `credential_store.file_store` 相应显示 `store`（无 KV，文件即存储）/ `mirror` / `off`。**结论：接上 KV 之后，账号保存路径上不再有任何 `/tmp` 依赖**（客户端 API Key 的 sqlite 仍然是 `/tmp`，那是另一件事）。
+
 **只读文件系统下的启动保护（本 fork 修复）**：`server.py` 在 **import 阶段**就调用 `api_key_store.get_api_key_store()`，而 Vercel 上项目目录只读、`data/` 又被 `.vercelignore` 排除，于是 `mkdir` 抛错、整个 import 失败 —— 表现是**所有路由 500（FUNCTION_INVOCATION_FAILED）**，而不是某个功能降级。修复分两层：`vercel.json` + `api/index.py` 同时把 `ACCOUNT_STORE_PATH` 与 `API_KEY_STORE_PATH` 默认到 `/tmp`（用户显式配置优先）；`api_key_store._ensure_writable()` 在任何环境下检测「目录能否真的写入」，不可写时打 `api_key_store_path_unwritable` 告警并退到系统临时目录（键仍可用，只是不跨冷启动）。**客户端 API Key 目前不入 KV**，冷启动后需在 WebUI 重新生成（后续若要持久化，做法与账号池相同：抽出 KV 后端 + 保留 sqlite 作为缓存）。
 
 ---
