@@ -93,6 +93,11 @@ class ChatSession:
     # session. Used to compute incremental (delta) prompts on the next turn
     # so the upstream conversation doesn't embed repeated history.
     sent_prompt: str = ""
+    # Turns whose history did not extend ``sent_prompt`` (the client sent only
+    # the newest message, or edited/truncated the history). Those turns resend
+    # the full prompt on the existing chain instead of abandoning the session;
+    # this counter is telemetry for that path.
+    diverged_turns: int = 0
 
     def next_message_id(self) -> int:
         """Return the next ``parent_message_id`` and bump the counter."""

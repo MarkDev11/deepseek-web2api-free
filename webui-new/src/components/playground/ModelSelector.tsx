@@ -7,7 +7,7 @@ import type { ModelsResponse } from '@/lib/types'
 interface Props {
   value: string
   onChange: (v: string) => void
-  /** Optional display-label map (e.g. mark quick/expert modes). */
+  /** Optional display-label map (e.g. annotate each name's capability preset). */
   labels?: Record<string, string>
 }
 
@@ -26,7 +26,7 @@ export function ModelSelector({ value, onChange, labels }: Props) {
   if (error) {
     return (
       <div className="text-xs text-destructive">
-        Failed to load model list (set <code className="font-mono">API_KEYS</code> in <code className="font-mono">.env</code> first):{' '}
+        Failed to load model list:{' '}
         {error instanceof ApiCallError ? error.message : String(error)}
       </div>
     )

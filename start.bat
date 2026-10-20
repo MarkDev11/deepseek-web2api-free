@@ -16,6 +16,24 @@ echo    HOST=%HOST%    PORT=%PORT%
 echo ==================================================
 echo.
 
+if not exist ".env" (
+    if not exist ".env.example" (
+        echo [错误] 未找到 .env 或 .env.example，无法创建配置文件。
+        pause
+        exit /b 1
+    )
+    copy /Y ".env.example" ".env" >nul 2>&1
+    if errorlevel 1 (
+        echo [错误] 无法从 .env.example 复制创建 .env，请检查目录写入权限。
+        pause
+        exit /b 1
+    )
+    echo [配置] 未找到 .env，已从 .env.example 复制创建。
+) else (
+    echo [配置] 已检测到 .env，保留现有配置。
+)
+echo.
+
 :: ============================================================
 ::  1. 定位系统 Python（需 3.10+）
 :: ============================================================
@@ -99,12 +117,7 @@ if "!NEED_BUILD!"=="0" (
         echo        仅启动后端 API；稍后可运行 %WEBUI_DIR%\scripts\build.bat 手动构建。
     ) else (
         pushd "%WEBUI_DIR%"
-        if not exist node_modules (
-            echo        安装 npm 依赖（首次构建可能需要几分钟）...
-            call npm install --no-audit --no-fund
-        )
-        echo        执行 npm run build ...
-        call npm run build
+        call scripts\build.bat
         set "BUILD_RC=!errorlevel!"
         popd
         if !BUILD_RC! neq 0 (
@@ -169,7 +182,7 @@ echo   服务启动后可通过以下地址访问：
 echo      WebUI 管理面板:  http://%ACCESS_HOST%:%PORT%/webui/
 echo      OpenAI API:      http://%ACCESS_HOST%:%PORT%/v1/chat/completions
 echo      健康检查:        http://%ACCESS_HOST%:%PORT%/health
-echo   管理密码: 见 .env 中 DEEPSEEK_ADMIN_PASSWORD 设置
+"%PY%" -c "import os; from dotenv import load_dotenv; load_dotenv('.env'); print('  管理密码: ' + os.environ.get('DEEPSEEK_ADMIN_PASSWORD', 'admin'))"
 echo   ============================================================
 echo.
 if not "%WEBUI_OPEN%"=="0" (

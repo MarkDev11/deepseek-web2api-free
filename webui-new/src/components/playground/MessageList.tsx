@@ -4,8 +4,8 @@ import { Card, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 
 /**
- * A single conversation turn. `reasoning` (DeepSeek expert-mode
- * thinking text) renders in a collapsible block above the content.
+ * A single conversation turn. `reasoning` (the thinking chain produced when
+ * thinking_enabled is on) renders in a collapsible block above the content.
  */
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
@@ -49,7 +49,7 @@ export function MessageList({ messages, streaming }: Props) {
         <CardContent className="text-center text-sm text-muted-foreground py-12">
           <Bot className="mx-auto h-8 w-8 mb-2 opacity-40 text-primary" />
           <p>Type a message on the left and click "Send"</p>
-          <p className="mt-1 text-xs">Requires <code className="font-mono">API_KEYS</code> in .env</p>
+          <p className="mt-1 text-xs">Client API keys can be created on the Settings page</p>
         </CardContent>
       </Card>
     )

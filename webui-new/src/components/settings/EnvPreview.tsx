@@ -20,8 +20,6 @@ interface EnvInfoResponse {
   admin_password_set: boolean
   admin_password_weak: boolean
   accounts_total: number
-  accounts_source_env: number
-  accounts_source_file: number
   crypto: {
     enabled: boolean
     fernet_configured: boolean
@@ -130,8 +128,7 @@ export function EnvPreview() {
         </CardHeader>
         <CardContent className="space-y-1.5 text-sm">
           <Row k="Total" v={String(info.accounts_total)} />
-          <Row k=".env source" v={String(info.accounts_source_env)} />
-          <Row k="Persisted file" v={String(info.accounts_source_file)} />
+          <Row k="Configured via" v="WebUI / data/accounts.json" />
         </CardContent>
       </Card>
 

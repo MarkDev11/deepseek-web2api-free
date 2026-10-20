@@ -106,7 +106,7 @@ export function AccountForm({ account, onSaved, onCancel }: Props) {
       </div>
       {!isEdit && (
         <p className="text-xs text-muted-foreground">
-          Accounts from .env (DEEPSEEK_TOKEN_1/2/...) are shown as read-only; edit .env and restart the service to change them.
+          New accounts are persisted to data/accounts.json.
         </p>
       )}
     </div>

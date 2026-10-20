@@ -13,9 +13,9 @@
 - **OpenAI-compatible** — `/v1/chat/completions` and `/v1/models` endpoints, supports `stream` mode.
 - **Anthropic-compatible** — `/v1/messages` endpoint, supports Claude API format.
 - **API key auth** — `/v1/*` supports `Authorization: Bearer` / `x-api-key`, suitable for public deployment.
-- **Chain of thought (Reasoning/Thinking)** — in expert mode, reasoning tokens are automatically separated and exposed via the `reasoning_content` field.
-- **Expert mode** — enables R1-style deep reasoning; responses contain a THINK→RESPONSE two-stage flow.
-- **Quick mode** — V3-style fast answers with low latency.
+- **Chain of thought (Reasoning/Thinking)** — with thinking enabled, reasoning tokens are automatically separated and exposed via the `reasoning_content` field.
+- **Thinking mode** — enables deep reasoning; responses contain a THINK→RESPONSE two-stage flow. DeepSeek upstream has merged the quick/expert modes, so the former expert experience is now just `thinking_enabled`.
+- **Low-latency direct answers** — with thinking off the model answers directly, with no reasoning-chain overhead.
 - **Web search** — enables real-time search enhancement via the `search_enabled` parameter.
 - **Function calling** — implements tool calls via DSML (DeepSeek Markup Language) prompt injection.
 - **Streaming sieve** — the `StreamSieve` engine detects DSML tool-call tags character-by-character and separates body text from tool calls in real time from the SSE stream.
@@ -59,10 +59,10 @@ You need to extract your DeepSeek credentials from the browser developer tools:
 
 | Credential | Location | Example |
 |------|------|------|
-| `DEEPSEEK_TOKEN` | Bearer value of the `Authorization` header | `eyJhbGciOiJIUzI1NiIs...` |
-| `DEEPSEEK_COOKIES` | Full value of the `Cookie` header | `cf_clearance=xxx; session=yyy; ...` |
+| Token | Value after `Bearer` in the `Authorization` header | Copy from the request headers |
+| Cookies | Full value of the `Cookie` header | Copy from the request headers |
 
-> **Two usage modes**: ① fill them into `.env` as the pool-empty fallback; ② log into the WebUI and add them on the "Account Pool" page (recommended — supports CRUD + one-click re-login).
+> Add credentials on the WebUI "Account Pool" page or store them in `data/accounts.json`. Account credentials are no longer read from `.env`.
 
 ### Configuration
 
@@ -74,34 +74,33 @@ cp .env.example .env
 Edit the `.env` file:
 
 ```ini
-# Required: client API keys, used to protect /v1/* public endpoints
-API_KEYS=***
+# Create and revoke client API keys in WebUI > Settings.
+# The full key is shown only once; the server stores only its hash.
 ALLOW_UNAUTHENTICATED_API=false
 
 # Required: WebUI admin panel password (defaults to "admin" if unset; MUST change before public deployment)
 DEEPSEEK_ADMIN_PASSWORD=***
 
-# Optional: DeepSeek account credentials (fallback when pool is empty since v3.2.0)
-# No longer preloaded into the pool for round-robin; only used as a read-only fallback when the panel has 0 accounts.
-# Recommended: log into the WebUI and add accounts on the "Account Pool" page (persisted to data/accounts.json, CRUD supported).
-DEEPSEEK_TOKEN=eyJhbG…
-DEEPSEEK_COOKIES=cf_clearance=xxx; session=yyy; ...
-# Multi-account format is the same (DEEPSEEK_TOKEN_1/COOKIES_1/EMAIL_1, first valid one used as fallback)
+# DeepSeek accounts are configured only in WebUI > Account Pool or data/accounts.json.
 
-# Optional: model routing (enabled by default — Playground shows quick/expert modes)
-MODEL_ROUTES={"deepseek-chat":"default","deepseek-reasoner":"expert"}
-
-# Optional: model name exposed in the API (does not affect the actual model used)
+# Optional: model name exposed in the API. This proxy serves ONE model,
+# and "thinking / not thinking" is decided by THINKING below — not two models.
 MODEL_NAME=deepseek-chat
+
+# Optional (advanced): model routing override. Not configured by default — when unset,
+# /v1/models lists MODEL_NAME only, and legacy model names (deepseek-reasoner, etc.) are still accepted as aliases.
+# MODEL_ROUTES={"my-model":"thinking"}
 
 # Optional: listen address/port (default 127.0.0.1:8080)
 HOST=127.0.0.1
 PORT=8080
 
-# Optional: mode control (auto=respect client / quick / expert)
-MODE=auto
+# Optional: capability switches (auto=respect client / enabled / disabled)
 THINKING=auto
 SEARCH=auto
+
+# Deprecated: kept for backward compatibility only — expert ≡ THINKING=enabled, quick ≡ THINKING=disabled
+# MODE=auto
 ```
 
 For the full list of variables, see `.env.example` and [AGENTS.md](AGENTS.md).
@@ -138,8 +137,7 @@ curl http://localhost:8080/health
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer ***"
 # → {"object":"list","data":[
-#      {"id":"deepseek-chat",...},
-#      {"id":"deepseek-reasoner",...}   # quick/expert two tiers enabled by default since v3.2.0 MODEL_ROUTES
+#      {"id":"deepseek-chat",...}   # one model only; enable thinking with THINKING=enabled
 #   ]}
 ```
 
@@ -155,18 +153,18 @@ Open in browser: http://localhost:8080/webui/
 
 Default password is `DEEPSEEK_ADMIN_PASSWORD` set in `.env` (defaults to `admin` if unset). Be sure to change the default password before public deployment.
 
-The account pool supports two kinds of accounts:
+Accounts are loaded only from `data/accounts.json`. Changes made in the WebUI Account Pool page are saved to this file; you can also maintain the JSON file directly.
 
-- **Panel accounts (recommended)**: add/edit/delete on the WebUI Account Pool page, persisted to `data/accounts.json`, participate in round-robin allocation, one-click re-login.
-- **env fallback (v3.2.0+)**: `DEEPSEEK_TOKEN/COOKIES` (or the `_1` multi-account format) in `.env` act as a **read-only fallback** — not part of normal round-robin; only auto-enabled when the panel has 0 accounts, ensuring the pool is never 503.
+Other WebUI features include:
+
 - **Overview** — live request statistics (total/success/failure/latency/uptime) + account pool status overview.
-- **Playground** — online test chat (quick/expert model modes, supports reasoning process visualization).
+- **Playground** — online test chat (thinking/search toggles, supports reasoning process visualization).
 - **Settings** — read-only view of the currently effective runtime configuration.
 ---
 
 ## Non-interactive Account Pool Configuration (for proxies / automation)
 
-> For SDKs, scripts, curl, CI, and proxies that do **not** go through the WebUI panel. Key point: since v3.0.0 the account pool's **primary config source is the `data/accounts.json` file**; `.env` only provides a single-account read-only fallback. For **multi-account round-robin**, non-interactive setups must write `data/accounts.json`.
+> For SDKs, scripts, curl, CI, and proxies that do **not** go through the WebUI panel. Account credentials are stored only in `data/accounts.json`; `.env` does not load account credentials. Maintain this file directly for non-interactive setups.
 
 **Full `data/accounts.json` format (v1 plaintext):**
 
@@ -195,13 +193,12 @@ JSON
 chmod 600 project_dir/data/accounts.json && chmod 700 project_dir/data
 
 # 2. Configure API auth (required for non-interactive use, else /v1/* → 503)
-#    API_KEYS=***    (comma-separated for multiple)
+#    After startup, log into the WebUI and create an API key in Settings.
 
 # 3. Start
 python -m uvicorn server:app --host 127.0.0.1 --port 8080
 ```
 
-- **Single-account fallback** (no file needed): set `DEEPSEEK_TOKEN_1`/`DEEPSEEK_COOKIES_1` in `.env` (or legacy `DEEPSEEK_TOKEN`/`DEEPSEEK_COOKIES`), used automatically when the pool is empty.
 - **Change the store path**: `ACCOUNT_STORE_PATH` environment variable.
 
 ---
@@ -234,13 +231,13 @@ OpenAI-compatible chat completion endpoint.
 
 | Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `model` | `string` | `"deepseek-chat"` | Model name (does not affect the actual model; only for identification) |
+| `model` | `string` | `"deepseek-chat"` | This proxy serves one model only, and this field does not select an upstream model; legacy names (`deepseek-reasoner`, etc.) are still accepted as aliases. Whether the model thinks is decided by `thinking_mode` or the server-side `THINKING` |
 | `messages` | `array` | required | Message list, supports `system`/`user`/`assistant`/`tool` roles |
 | `stream` | `boolean` | `false` | Whether to stream output |
 | `temperature` | `float` | `null` | Sampling temperature (passed to DeepSeek but effect depends on the server) |
 | `top_p` | `float` | `null` | Top-p sampling |
 | `max_tokens` | `int` | `null` | Maximum generated tokens |
-| `thinking_mode` | `boolean` | `false` | Enable expert-mode deep reasoning |
+| `thinking_mode` | `boolean` | `false` | enable deep reasoning (upstream `thinking_enabled`, the former expert mode) |
 | `search_enabled` | `boolean` | `false` | Enable web search enhancement |
 | `tools` | `array` | `null` | OpenAI-format tool definitions |
 | `tool_choice` | `string\|dict` | `null` | Tool selection strategy |
@@ -380,48 +377,61 @@ event: message_stop
 data: {}
 ```
 
-> **Note**: the Anthropic endpoint shares the same underlying adapter as the OpenAI endpoint; the MODE/THINKING/SEARCH environment variables affect both endpoints.
+> **Note**: the Anthropic endpoint shares the same underlying adapter as the OpenAI endpoint; the THINKING/SEARCH environment variables (and the deprecated `MODE`) affect both endpoints.
 
 ---
 
-## MODE / THINKING / SEARCH explained
+## THINKING / SEARCH explained (MODE deprecated)
 
-These three environment variables are independent control dimensions that together decide each request's behavior:
+> **Since v3.3.8: DeepSeek upstream has merged "quick mode" / "expert mode", and this proxy serves a single model too.**
+> The web client `client/settings?scope=model` now returns
+> `{"model_type":"default","name":"快速模式","enabled":true,"switchable":true}`,
+> `{"model_type":"expert","name":"专家模式","enabled":false,"switchable":false}`,
+> `{"model_type":"vision","name":"识图模式","enabled":false,"switchable":false}`,
+> and upstream rewrites the `model_type` in the request body back to `"default"` unconditionally (visible in the `event: ready` frame).
+> In other words there is **only one chat model**, and the former "expert experience" is provided entirely by `thinking_enabled`.
+> A/B tests show `model_type=default` and `expert` produce character-for-character identical output for the same prompt, with no latency difference and identical DSML tool-calling behavior.
+
+So the two real capability switches now are:
 
 | Env var | Values | Default | Description |
 |----------|--------|------|------|
-| `MODE` | `auto` / `quick` / `expert` | `auto` | controls `model_type`: `"default"`(quick) or `"expert"` |
-| `THINKING` | `auto` / `enabled` / `disabled` | `auto` | controls `thinking_enabled`: `true` / `false` |
+| `THINKING` | `auto` / `enabled` / `disabled` | `auto` | controls `thinking_enabled`: `true` / `false`, i.e. the former expert mode |
 | `SEARCH` | `auto` / `enabled` / `disabled` | `auto` | controls `search_enabled` (web search): `true` / `false` |
+
+`MODE` is **deprecated** and kept only for compatibility with old configs: `expert` ≡ `THINKING=enabled`, `quick` ≡ `THINKING=disabled`, `auto` does not interfere. Use `THINKING` directly in new configurations.
+
+`model_type` is still sent with each request (keeping the request shape identical to the browser), but it is a **protocol field** rather than a capability selector: it defaults to `"default"` and only changes when explicitly set in the dict form of `MODEL_ROUTES` (leaving room for upstream re-enabling something like `vision` later).
 
 Priority: environment variable > request parameter. When an env var is `auto`, the corresponding field in the client request decides the behavior.
 
 ### Combination examples
 
-| MODE | THINKING | SEARCH | Behavior | Typical use case |
-|------|----------|--------|----------|----------|
-| `auto` | `auto` | `auto` | decided by client `thinking_mode` / `search_enabled` | fully flexible client control |
-| `quick` | `disabled` | `auto` | force V3 quick mode, no reasoning | low latency, no deep reasoning needed |
-| `expert` | `enabled` | `enabled` | force R1 expert mode + chain of thought + web search | deep reasoning + real-time info |
-| `quick` | `enabled` | `disabled` | quick mode + thinking, search off | fast responses with reasoning attached |
+| THINKING | SEARCH | Behavior | Typical use case |
+|----------|--------|----------|----------|
+| `auto` | `auto` | decided by client `thinking_mode` / `search_enabled` | fully flexible client control |
+| `disabled` | `auto` | force thinking off, answer directly | low latency, no deep reasoning needed |
+| `enabled` | `enabled` | force chain of thought + web search | deep reasoning + real-time info |
+| `enabled` | `disabled` | chain of thought, search off | fast responses with reasoning attached |
 
 ### Env var / request parameter interplay
 
 ```
-MODE=auto, THINKING=auto, SEARCH=auto, request thinking_mode=true  →  quick + has reasoning_content
-MODE=expert, THINKING=disabled, request thinking_mode=true  →  expert + no reasoning_content + search decided by client
-MODE=quick, THINKING=enabled, SEARCH=disabled  →  quick + has reasoning_content + no web search
+THINKING=auto, SEARCH=auto, request thinking_mode=true  →  has reasoning_content, search decided by client
+THINKING=disabled, request thinking_mode=true  →  no reasoning_content (force-disabled by the server)
+THINKING=enabled, SEARCH=disabled  →  has reasoning_content + no web search
+MODE=expert (legacy spelling)  →  equivalent to THINKING=enabled
 ```
 
 ---
 
 ## Chain of Thought (Reasoning / Thinking)
 
-When `thinking_mode=true` (i.e., expert mode), reasoning tokens are exposed via the `reasoning_content` field in both streaming and non-streaming responses.
+When `thinking_mode=true` (with thinking enabled), reasoning tokens are exposed via the `reasoning_content` field in both streaming and non-streaming responses.
 
 ### Reasoning in streaming responses
 
-In expert mode the SSE stream first outputs reasoning tokens, then the final answer:
+With thinking enabled the SSE stream first outputs reasoning tokens, then the final answer:
 
 ```
 data: {"id":"...","choices":[{"index":0,"delta":{"reasoning_content":""},"finish_reason":null}]}
@@ -525,19 +535,27 @@ curl http://localhost:8080/v1/chat/completions \
 
 ---
 
-## Model routing (v2.2.0)
+## Model routing (v2.2.0; optional advanced override since v3.3.8)
 
-Through the `MODEL_ROUTES` environment variable, clients can send different `model` fields to let the proxy auto-select `model_type` (quick/expert) and default thinking/search settings:
+**Not configured by default.** This proxy serves a single model: `/v1/models` lists only `MODEL_NAME` (default `deepseek-chat`), and "thinking / not thinking" is decided by `THINKING` (or the request's `thinking_mode`) — **there are not two models**. Since upstream has merged the quick/expert modes, a model name cannot select a different upstream model either.
+
+Clients that hardcode the old names (`deepseek-reasoner`, etc.) do not get a 404: those names are normalized to `deepseek-chat` through `model_router.LEGACY_MODEL_ALIASES` and keep working, but they **no longer change behaviour** (they used to mean "thinking on"; set `THINKING=enabled` when you want reasoning now).
+
+Configure `MODEL_ROUTES` only when you really want per-model-name routing; once configured, `/v1/models` lists its keys instead:
 
 ```bash
-# Simple form — string value
-MODEL_ROUTES={"deepseek-chat":"default","deepseek-reasoner":"expert"}
+# Simple form — string value (capability preset)
+#   "default"  → thinking off (direct answer)
+#   "thinking" → thinking on (the former "expert experience")
+#   "expert"   → legacy alias of "thinking", for configs from before v3.3.8
+#   "quick"    → legacy alias of "default"
+MODEL_ROUTES={"my-model":"thinking"}
 
-# Full form — dict value
-MODEL_ROUTES={"deepseek-reasoner":{"model_type":"expert","thinking":"enabled","search":"disabled"}}
+# Full form — dict value (search and the `model_type` protocol field can be set explicitly)
+MODEL_ROUTES={"my-model":{"thinking":"enabled","search":"disabled"}}
 ```
 
-Model names not matched fall back to the existing `MODE` / `THINKING` / `SEARCH` env variables. The `/v1/models` endpoint returns all model names declared in `MODEL_ROUTES`.
+Model names not matched are handled by the `THINKING` / `SEARCH` env variables (`MODE` is deprecated but still accepted).
 
 ---
 
@@ -585,7 +603,7 @@ Before deploying to the public internet, check in order:
 
 1. **Change the default admin password**: `DEEPSEEK_ADMIN_PASSWORD=***` in `.env` (random characters). The service **refuses to start** when using the default password with a public binding.
 2. **Set a Fernet encryption key**: `DEEPSEEK_ENCRYPTION_KEY=***` (generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`). Existing plaintext `data/accounts.json` is auto-migrated on first startup; the original is kept as `accounts.json.v1.bak`.
-3. **Set API keys**: `API_KEYS=***,***` in `.env` (comma-separated for multiple). Keep `ALLOW_UNAUTHENTICATED_API` as `false`.
+3. **Set API keys**: log into the WebUI, create a client key on the Settings page, and save its one-time value in your client. Only the key hash is stored in `data/api_keys.sqlite3`; keep `ALLOW_UNAUTHENTICATED_API` as `false`.
 4. **Configure the CORS whitelist**: `ALLOWED_ORIGINS=https://app.example.com`, rather than relying on the default same-origin policy.
 5. **If using a reverse proxy** (nginx, Caddy, Traefik): set `TRUSTED_PROXIES=10.0.0.0/8` (your proxy's CIDR) so admin rate limiting correctly identifies client IPs.
 6. **Bind address**: default `127.0.0.1`. If using a reverse proxy, keep loopback; if exposing directly to the internet, set `HOST=0.0.0.0` and ensure TLS + WAF in front.
@@ -657,7 +675,7 @@ Before deploying to the public internet, check in order:
 
 | File | Responsibility |
 |------|------|
-| `server.py` | FastAPI server, routing, MODE/THINKING control, OpenAI SSE formatting |
+| `server.py` | FastAPI server, routing, THINKING/SEARCH capability control, OpenAI SSE formatting |
 | `adapter.py` | DeepSeek protocol adapter — PoW challenge solving, session create/manage, native SSE parsing, fragment state machine |
 | `anthropic_format.py` | Anthropic `/v1/messages` format conversion — request parsing, response assembly, SSE generation |
 | `tool_sieve.py` | StreamSieve streaming sieve engine — character-by-character DSML tool-call tag detection, real-time separation of body text and tool calls |
@@ -670,7 +688,7 @@ Before deploying to the public internet, check in order:
 ### Request lifecycle
 
 1. **Client request** → `/v1/chat/completions` receives an OpenAI-format request.
-2. **Mode parsing** → `server.py` determines `model_type` and `thinking_enabled` based on env vars and request params.
+2. **Capability resolution** → `resolve_model_controls()` picks `thinking_enabled` / `search_enabled` (`model_type` is a protocol field, always `"default"`).
 3. **DSML injection** → if there are `tools`, `build_dsml_tool_prompt()` generates a DSML-format system prompt.
 4. **PoW solving** → `adapter.py` requests and solves the DeepSeekHashV1 challenge.
 5. **Session creation** → creates a new DeepSeek Chat session (optionally reused).
@@ -712,16 +730,17 @@ Before deploying to the public internet, check in order:
 
 Usually invalid credentials or a network issue:
 
-1. Check that `DEEPSEEK_TOKEN` and `DEEPSEEK_COOKIES` in `.env` are still valid (re-extract by logging into chat.deepseek.com).
+1. Check the account status in WebUI > Account Pool; for non-interactive deployments, verify the credentials in `data/accounts.json` are still valid.
 2. Check that `chat.deepseek.com` is reachable (may need a proxy).
 3. Check the specific error in the console logs.
 
 ### Q: Streaming output only has reasoning_content, no content
 
-When `thinking_mode=true` (expert mode), the model outputs the full reasoning process first, then the answer. If you see only reasoning without content:
+With thinking enabled (`thinking_mode=true`), the model outputs the full reasoning process first, then the answer. If you see only reasoning without content:
 
 1. Wait for the model to finish reasoning (the response is not over).
-2. If it's a real bug: confirm the server version and check whether `finish_reason` is output normally. Known older versions may lack the `finish_reason: "stop"` frame.
+2. Upstream occasionally ends the turn after only the THINK fragment (reproducible in practice); `content` is then empty while `finish_reason` is normal. This is upstream behavior — just retry.
+3. If it's a real bug: confirm the server version and check whether `finish_reason` is output normally. Known older versions may lack the `finish_reason: "stop"` frame.
 
 ### Q: How do I disable chain-of-thought / reasoning display?
 
@@ -729,9 +748,25 @@ Set `THINKING=disabled`; then even if `thinking_mode=true` in the request, `reas
 
 ### Q: Constantly loading / very slow responses
 
-- Expert mode (`thinking_mode=true`) is inherently slower; the model is doing full reasoning.
+- With thinking enabled (`thinking_mode=true`) responses are inherently slower; the model is doing full reasoning.
 - PoW solving can take seconds on low-performance machines.
 - Check network latency to `chat.deepseek.com`.
+
+### Q: The model "forgets" what was said in earlier turns
+
+First confirm how you call it — both styles are supported, with different requirements:
+
+| Calling style | Requirement | Behavior |
+|---|---|---|
+| Resend the full `messages` every turn (OpenAI spec) | include `X-Conversation-Id` or `user` to reuse the upstream session | from the second turn on, only the **new** part is sent upstream, saving tokens |
+| Send only the **latest** user message each turn | `X-Conversation-Id` or `user` is required | the same session and parent-message chain are reused, and the full prompt is re-sent once to fill in the context |
+
+Troubleshooting checklist:
+
+1. Did you pass `X-Conversation-Id` (or the OpenAI top-level `user` / Anthropic `metadata.user_id`)? Without it a new session is created every turn, so amnesia is guaranteed.
+2. Did more than `SESSION_CACHE_TTL` (default 1800 seconds) pass between the two turns?
+3. Are you switching back and forth between streaming and non-streaming? Since v3.3.8 both modes share the same session cache; earlier versions created one session per mode.
+4. A `session_prompt_diverged` line in the log is a normal hint: this turn took the "keep session + resend the full prompt" path.
 
 ### Q: curl on Windows returns 422 for Chinese requests
 
@@ -794,31 +829,26 @@ DeepSeek's token validity is unclear. If you encounter `401` or `403` responses,
 |------|--------|------|------|
 | `HOST` | `127.0.0.1` | no | Listen address. `0.0.0.0` refuses to start with default admin password |
 | `PORT` | `8080` | no | Server listen port |
-| `API_KEYS` | `""` | required for public | API keys for client access to `/v1/*`, comma-separated for multiple |
-| `DEEPSEEK_API_KEY` | `""` | no | single client API key alias |
 | `ALLOW_UNAUTHENTICATED_API` | `false` | no | whether to allow unauthenticated `/v1/*` access; do NOT enable for public |
 | `ALLOW_INSECURE_PUBLIC_DEFAULTS` | `false` | no | explicitly confirm using default password on public internet (not recommended) |
 
-### DeepSeek accounts
+Client API keys are managed in WebUI > Settings, and only hashes are stored in SQLite. Legacy `.env` values from `API_KEYS` / `DEEPSEEK_API_KEY` are imported once when the key database is first created; remove the old entries from `.env` after confirming clients still work.
+
+### Account pool storage
 
 | Variable | Default | Required | Description |
 |------|--------|------|------|
-| `DEEPSEEK_TOKEN` | `""` | required if using an account | DeepSeek API Bearer token (single-account format) |
-| `DEEPSEEK_COOKIES` | `""` | required if using an account | DeepSeek cookie value (single-account format) |
-| `DEEPSEEK_TOKEN_N` | `""` | no | Nth DeepSeek account token, e.g. `DEEPSEEK_TOKEN_1` |
-| `DEEPSEEK_COOKIES_N` | `""` | no | Nth DeepSeek account cookies |
-| `DEEPSEEK_EMAIL_N` | `"env-N"` | no | Nth account remark/identifier |
 | `ACCOUNT_STORE_PATH` | `data/accounts.json` | no | panel-persisted account save path |
 
 ### Model behavior
 
 | Variable | Default | Description |
 |------|--------|------|
-| `MODEL_NAME` | `"deepseek-chat"` | model name shown in `/v1/models` by default (shows route table if `MODEL_ROUTES` exists) |
-| `MODE` | `"auto"` | `auto` / `quick` / `expert` |
-| `THINKING` | `"auto"` | `auto` / `enabled` / `disabled` |
-| `SEARCH` | `"auto"` | `auto` / `enabled` / `disabled` |
-| `MODEL_ROUTES` | `""` | JSON route table, switches `model_type`/thinking/search by `model` field |
+| `MODEL_NAME` | `"deepseek-chat"` | the **single** model name this proxy serves; used by `/v1/models` and API responses |
+| `THINKING` | `"auto"` | `auto` / `enabled` / `disabled` — controls `thinking_enabled` (the former expert-mode switch; **this** is what decides whether the model thinks) |
+| `SEARCH` | `"auto"` | `auto` / `enabled` / `disabled` — controls `search_enabled` |
+| `MODEL_ROUTES` | `""` | optional advanced override: a JSON route table mapping a model name to thinking/search capability presets. When set, `/v1/models` lists its keys; when unset only `MODEL_NAME` is listed and legacy names such as `deepseek-reasoner` are still accepted as aliases |
+| `MODE` | `"auto"` | **deprecated**, kept only for old configs: `expert` ≡ `THINKING=enabled`, `quick` ≡ `THINKING=disabled` |
 
 ### Admin panel
 
@@ -854,13 +884,6 @@ DeepSeek's token validity is unclear. If you encounter `401` or `403` responses,
 | `DEEPSEEK_JITTER_SECS` | `0.0` | random jitter between calls (seconds) |
 | `DSML_MAX_BUFFER_BYTES` | `1048576` | StreamSieve capture buffer cap |
 | `DISABLE_AUTO_RECOVER` | `false` | set true to disable account auto-recovery |
-
-### Anti-detection — per-account proxy
-
-| Variable | Description |
-|------|------|
-| `DEEPSEEK_PROXY` / `DEEPSEEK_PROXY_N` | upstream proxy URL for a single / the Nth account |
-| `DEEPSEEK_EMAIL` | legacy single-account email remark |
 
 ---
 

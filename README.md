@@ -13,9 +13,9 @@
 - **OpenAI 兼容** — `/v1/chat/completions` 与 `/v1/models` 接口，支持 `stream` 模式
 - **Anthropic 兼容** — `/v1/messages` 接口，支持 Claude API 格式
 - **API Key 鉴权** — `/v1/*` 支持 `Authorization: Bearer` / `x-api-key`，适合公网部署
-- **思维链（Reasoning/Thinking）** — 专家模式下自动分离思维链 tokens 并通过 `reasoning_content` 字段输出
-- **专家模式（Expert Mode）** — 开启 R1 风格深度推理，响应含 THINK→RESPONSE 双阶段
-- **Quick 模式** — V3 风格快速回答，低延迟
+- **思维链（Reasoning/Thinking）** — 开启 `thinking_mode` 后自动分离思维链 tokens 并通过 `reasoning_content` 字段输出
+- **思考模式** — DeepSeek 已把「快速模式 / 专家模式」合并为同一个模型（见下方说明），原专家体验现由 `thinking_enabled` 提供，响应含 THINK→RESPONSE 双阶段
+- **低延迟直答** — 关闭思考即直接回答，无推理链开销
 - **联网搜索** — 通过 `search_enabled` 参数启用实时搜索增强
 - **Function Calling** — 基于 DSML（DeepSeek Markup Language）提示词注入实现工具调用
 - **流式筛分** — `StreamSieve` 引擎，逐字符检测 DSML 工具调用标签，从 SSE 流中实时分离正文与工具调用
@@ -59,10 +59,10 @@ pip install -r requirements.txt
 
 | 凭证 | 位置 | 示例 |
 |------|------|------|
-| `DEEPSEEK_TOKEN` | `Authorization` 请求头的 Bearer 值 | `eyJhbGciOiJIUzI1NiIs...` |
-| `DEEPSEEK_COOKIES` | `Cookie` 请求头的完整值 | `cf_clearance=xxx; session=yyy; ...` |
+| Token | `Authorization` 请求头 `Bearer` 后的值 | 从请求头复制 |
+| Cookies | `Cookie` 请求头的完整值 | 从请求头复制 |
 
-> **两种使用方式**：① 填入 `.env` 作为池空兜底；② 直接登录 WebUI 在「账号池」页添加（推荐，可增删改 + 一键重登录）。
+> 将凭证添加到 WebUI「账号池」，或写入 `data/accounts.json`。账号凭证不再从 `.env` 读取。
 
 ### 配置
 
@@ -74,34 +74,33 @@ cp .env.example .env
 编辑 `.env` 文件：
 
 ```ini
-# 必填：客户端 API Key，用于保护 /v1/* 公网接口
-API_KEYS=sk-change-me
+# 客户端 API Key 在 WebUI「设置」页创建和撤销
+# 完整 Key 仅在创建时显示；服务端仅保存哈希
 ALLOW_UNAUTHENTICATED_API=false
 
 # 必填：WebUI 管理面板密码（未设置默认 admin，公网部署前必须修改）
 DEEPSEEK_ADMIN_PASSWORD=change-me
 
-# 可选：DeepSeek 账号凭证（v3.2.0 起为「池空兜底」）
-# 不再预加载进账号池参与轮询；仅当面板账号数为 0 时作为只读兜底使用。
-# 推荐：直接登录 WebUI 在「账号池」页面添加账号（持久化到 data/accounts.json，可增删改）。
-DEEPSEEK_TOKEN=eyJhbGciOiJIUzI1NiIs...
-DEEPSEEK_COOKIES=cf_clearance=xxx; session=yyy; ...
-# 多账号格式同理（DEEPSEEK_TOKEN_1/COOKIES_1/EMAIL_1，取第一个有效作为兜底）
+# DeepSeek 账号只通过 WebUI「账号池」或 data/accounts.json 配置。
 
-# 可选：模型路由（默认已启用——Playground 显示快速/专家两种模式）
-MODEL_ROUTES={"deepseek-chat":"default","deepseek-reasoner":"expert"}
-
-# 可选：API 中暴露的模型名称（不影响实际使用的模型）
+# 可选：API 中暴露的模型名称。本代理只服务一个模型，
+# 「思考 / 不思考」由下面的 THINKING 决定，不是两个模型。
 MODEL_NAME=deepseek-chat
+
+# 可选（高级）：模型路由覆盖。默认不配置——不配置时 /v1/models 只列出 MODEL_NAME，
+# 老的 model 名（deepseek-reasoner 等）作为别名照常接受。
+# MODEL_ROUTES={"my-model":"thinking"}
 
 # 可选：监听地址/端口（默认 127.0.0.1:8080）
 HOST=127.0.0.1
 PORT=8080
 
-# 可选：模式控制（auto=尊重客户端 / quick / expert）
-MODE=auto
+# 可选：能力开关（auto=尊重客户端 / enabled / disabled）
 THINKING=auto
 SEARCH=auto
+
+# 已废弃：仅兼容旧配置，expert ≡ THINKING=enabled，quick ≡ THINKING=disabled
+# MODE=auto
 ```
 
 完整变量说明见 `.env.example` 与 [AGENTS.md](AGENTS.md)。
@@ -138,8 +137,7 @@ curl http://localhost:8080/health
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-your-api-key"
 # → {"object":"list","data":[
-#      {"id":"deepseek-chat",...},
-#      {"id":"deepseek-reasoner",...}   # v3.2.0 起 MODEL_ROUTES 默认启用快速/专家两档
+#      {"id":"deepseek-chat",...}   # 只有一个模型；开启思考请设 THINKING=enabled
 #   ]}
 ```
 
@@ -155,19 +153,19 @@ curl http://localhost:8080/v1/models \
 
 默认密码为 `.env` 中设置的 `DEEPSEEK_ADMIN_PASSWORD`（未设置则为 `admin`）。公网部署前请务必修改默认密码。
 
-账号池支持两类账号：
+账号只从 `data/accounts.json` 加载。WebUI 账号池中的增删改操作会写入该文件；也可以直接维护该 JSON 文件。
 
-- **面板账号（推荐）**：在 WebUI 账号池页添加/编辑/删除，持久化到 `data/accounts.json`，参与轮询分配，可一键重登录。
-- **env 兜底（v3.2.0+）**：`.env` 中 `DEEPSEEK_TOKEN/COOKIES`（或 `_1` 多账号格式）作为**只读兜底**——不参与常规轮询，仅当面板账号数为 0 时自动启用，保证池空不 503。
+WebUI 其他功能包括：
+
 - **概览** — 实时请求统计（总量/成功/失败/延迟/运行时长）+ 账号池状态一览
-- **Playground** — 在线测试对话（快速/专家两种模型模式，支持推理过程可视化）
+- **Playground** — 在线测试对话（单个模型 + 「思考模式」/「联网搜索」两个开关，支持推理过程可视化）
 - **设置** — 只读查看当前生效的运行时配置
 
 ---
 
 ## 非交互式账号池配置（代理 / 自动化工具）
 
-> **给 SDK、脚本、curl、CI、代理用**，不经过 WebUI 面板。要点：v3.0.0+ 账号池的**主配置源是 `data/accounts.json` 文件**，`.env` 只提供单账号只读兜底。要跑**多账号轮询**，非交互场景必须写 `data/accounts.json`。
+> **给 SDK、脚本、curl、CI、代理用**，不经过 WebUI 面板。账号凭证统一存储在 `data/accounts.json`；`.env` 不读取账号凭证。非交互场景直接维护该文件即可。
 
 **`data/accounts.json`（v1 明文）完整格式：**
 
@@ -196,13 +194,12 @@ JSON
 chmod 600 project_dir/data/accounts.json && chmod 700 project_dir/data
 
 # 2. 配 API 鉴权（非交互必需，否则 /v1/* → 503）
-#    API_KEYS=***    （多个逗号分隔）
+#    首次启动后登录 WebUI，在「设置」页创建 API Key
 
 # 3. 启动
 python -m uvicorn server:app --host 127.0.0.1 --port 8080
 ```
 
-- **单账号兜底**（不写文件）：直接在 `.env` 设 `DEEPSEEK_TOKEN_1`/`DEEPSEEK_COOKIES_1`（或 legacy `DEEPSEEK_TOKEN`/`DEEPSEEK_COOKIES`），池空自动兜底。
 - **改存储路径**：`ACCOUNT_STORE_PATH` 环境变量。
 
 ---
@@ -235,14 +232,15 @@ OpenAI 兼容的聊天补全接口。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `model` | `string` | `"deepseek-chat"` | 模型名称（不影响实际模型，仅用于标识） |
+| `model` | `string` | `"deepseek-chat"` | 本代理只有一个模型，此字段不影响上游模型；老名字（`deepseek-reasoner` 等）作为别名照常接受。是否思考看 `thinking_mode` 或服务端 `THINKING` |
 | `messages` | `array` | 必填 | 消息列表，支持 `system`/`user`/`assistant`/`tool` 角色 |
 | `stream` | `boolean` | `false` | 是否流式输出 |
 | `temperature` | `float` | `null` | 采样温度（传递给 DeepSeek 但效果取决于服务端） |
 | `top_p` | `float` | `null` | Top-p 采样 |
 | `max_tokens` | `int` | `null` | 最大生成 tokens |
-| `thinking_mode` | `boolean` | `false` | 开启专家模式深度推理 |
+| `thinking_mode` | `boolean` | `false` | 开启深度推理（上游 `thinking_enabled`，即原「专家模式」） |
 | `search_enabled` | `boolean` | `false` | 开启联网搜索增强 |
+| `user` | `string` | `null` | 多轮会话标识（与 `X-Conversation-Id` 二选一，见「多轮对话」） |
 | `tools` | `array` | `null` | OpenAI 格式的工具定义 |
 | `tool_choice` | `string\|dict` | `null` | 工具选择策略 |
 
@@ -387,44 +385,56 @@ data: {}
 
 ---
 
-## MODE / THINKING / SEARCH 详解
+## THINKING / SEARCH 详解（含已废弃的 MODE）
 
-这三个环境变量是独立的控制维度，共同决定每个请求的行为：
+> **v3.3.8 起：DeepSeek 已合并「快速模式 / 专家模式」，本项目也只服务一个模型。**
+> 网页端 `client/settings?scope=model` 现在返回
+> `{"model_type":"default","enabled":true,"switchable":true}`、
+> `{"model_type":"expert","enabled":false,"switchable":false}`、
+> `{"model_type":"vision","enabled":false,"switchable":false}`，
+> 且上游会把请求体里的 `model_type` 一律改写回 `"default"`（可在 `event: ready` 帧看到）。
+> 也就是说**只有一个对话模型**，原来的「专家体验」完全由 `thinking_enabled` 提供。
+> 实测 `model_type=default` 与 `expert` 在同一 prompt 下输出逐字相同、时延无差异、工具调用表现一致。
+
+因此现在的两个真正开关是：
 
 | 环境变量 | 可选值 | 默认值 | 说明 |
 |----------|--------|--------|------|
-| `MODE` | `auto` / `quick` / `expert` | `auto` | 控制 `model_type`：`"default"`(quick) 或 `"expert"` |
-| `THINKING` | `auto` / `enabled` / `disabled` | `auto` | 控制 `thinking_enabled`：`true` / `false` |
+| `THINKING` | `auto` / `enabled` / `disabled` | `auto` | 控制 `thinking_enabled`：`true` / `false`，即原「专家模式」 |
 | `SEARCH` | `auto` / `enabled` / `disabled` | `auto` | 控制 `search_enabled`（联网搜索）：`true` / `false` |
+| `MODE`（已废弃） | `auto` / `quick` / `expert` | `auto` | **仅为兼容旧配置保留**：`expert` ≡ `THINKING=enabled`，`quick` ≡ `THINKING=disabled`，`auto` 不介入。新配置请直接用 `THINKING` |
+
+`model_type` 仍然会随请求发送（保持与浏览器一致的请求形态），但它是**协议字段**而非能力选择：默认值 `"default"`，只在 `MODEL_ROUTES` 的字典形式里显式指定时才改变（留给上游将来重新放开 `vision` 之类的场景）。
 
 优先级：环境变量 > 请求参数。当环境变量为 `auto` 时，由客户端请求中的对应字段决定行为。
 
 ### 组合示例
 
-| MODE | THINKING | SEARCH | 行为 | 典型场景 |
-|------|----------|--------|------|----------|
-| `auto` | `auto` | `auto` | 由客户端 `thinking_mode` / `search_enabled` 决定 | 完全由客户端灵活控制 |
-| `quick` | `disabled` | `auto` | 强制 V3 快速模式，无推理 | 追求低延迟、不需要深度推理 |
-| `expert` | `enabled` | `enabled` | 强制 R1 专家模式 + 思维链 + 联网搜索 | 深度推理 + 实时信息 |
-| `quick` | `enabled` | `disabled` | 快速模式 + 思考，关闭联网 | 快速响应但附带推理过程 |
+| THINKING | SEARCH | 行为 | 典型场景 |
+|----------|--------|------|----------|
+| `auto` | `auto` | 由客户端 `thinking_mode` / `search_enabled` 决定 | 完全由客户端灵活控制 |
+| `disabled` | `auto` | 强制关闭思考，直接作答 | 追求低延迟、不需要深度推理 |
+| `enabled` | `enabled` | 强制思维链 + 联网搜索 | 深度推理 + 实时信息 |
+| `enabled` | `disabled` | 思维链但关闭联网 | 快速响应但附带推理过程 |
 
 ### 环境变量与请求参数互斥
 
 ```
-MODE=auto, THINKING=auto, SEARCH=auto, 请求 thinking_mode=true  →  quick + 有 reasoning_content
-MODE=expert, THINKING=disabled, 请求 thinking_mode=true  →  expert + 无 reasoning_content + 由客户端决定搜索
-MODE=quick, THINKING=enabled, SEARCH=disabled  →  quick + 有 reasoning_content + 无联网搜索
+THINKING=auto,    SEARCH=auto, 请求 thinking_mode=true  →  有 reasoning_content，搜索由客户端决定
+THINKING=disabled,              请求 thinking_mode=true  →  无 reasoning_content（服务端强制关闭）
+THINKING=enabled, SEARCH=disabled                        →  有 reasoning_content + 无联网搜索
+MODE=expert（旧写法）                                    →  等价于 THINKING=enabled
 ```
 
 ---
 
 ## 思维链（Reasoning / Thinking）
 
-当 `thinking_mode=true`（即 expert 模式）时，流式和非流式响应中推理 tokens 通过 `reasoning_content` 字段暴露。
+当 `thinking_mode=true`（或 `THINKING=enabled`）时，流式和非流式响应中推理 tokens 通过 `reasoning_content` 字段暴露。
 
 ### 流式响应中的推理
 
-专家模式下 SSE 流先输出推理 tokens，再输出正式回答：
+开启思考后，SSE 流先输出推理 tokens，再输出正式回答：
 
 ```
 data: {"id":"...","choices":[{"index":0,"delta":{"reasoning_content":""},"finish_reason":null}]}
@@ -528,19 +538,27 @@ curl http://localhost:8080/v1/chat/completions \
 
 ---
 
-## 模型路由（v2.2.0）
+## 模型路由（v2.2.0；v3.3.8 起为可选的高级覆盖）
 
-通过 `MODEL_ROUTES` 环境变量，客户端可以发送不同的 `model` 字段让代理自动选择 `model_type`（quick/expert）和默认的 thinking/search 设置：
+**默认不配置。** 本代理只服务一个模型：`/v1/models` 只列出 `MODEL_NAME`（默认 `deepseek-chat`），「思考 / 不思考」由 `THINKING`（或请求里的 `thinking_mode`）决定——**不是两个模型**。由于上游已合并快速/专家模式，model 名也不可能选出不同的上游模型。
+
+写死老名字的客户端（`deepseek-reasoner` 等）不会 404：这些名字经 `model_router.LEGACY_MODEL_ALIASES` 归一到 `deepseek-chat`，照常服务，但**不改变行为**（旧版它们等于「开思考」，现在要思考请设 `THINKING=enabled`）。
+
+确实需要按 model 名分流时才配置 `MODEL_ROUTES`；配置后 `/v1/models` 会改为列出它的键：
 
 ```bash
-# 简单形式 — 字符串值
-MODEL_ROUTES={"deepseek-chat":"default","deepseek-reasoner":"expert"}
+# 简单形式 — 字符串值（能力预设）
+#   "default"  → 关闭思考（直答）
+#   "thinking" → 开启思考（原「专家体验」）
+#   "expert"   → thinking 的旧别名，兼容 3.3.8 之前的配置
+#   "quick"    → default 的旧别名
+MODEL_ROUTES={"my-model":"thinking"}
 
-# 完整形式 — dict 值
-MODEL_ROUTES={"deepseek-reasoner":{"model_type":"expert","thinking":"enabled","search":"disabled"}}
+# 完整形式 — dict 值（可显式指定 model_type 协议字段与 search）
+MODEL_ROUTES={"my-model":{"thinking":"enabled","search":"disabled"}}
 ```
 
-未命中的 model 名按既有 `MODE` / `THINKING` / `SEARCH` env 变量处理。`/v1/models` 端点会返回 `MODEL_ROUTES` 中声明的所有 model 名。
+未命中的 model 名按 `THINKING` / `SEARCH` env 变量处理（`MODE` 已废弃，仍兼容）。
 
 ---
 
@@ -588,7 +606,7 @@ Retry-After: 47
 
 1. **修改默认 admin 密码**：`.env` 中 `DEEPSEEK_ADMIN_PASSWORD=…`（16+ 字符随机）。默认密码 + 公网绑定时服务**会拒绝启动**。
 2. **设置 Fernet 加密 key**：`DEEPSEEK_ENCRYPTION_KEY=…`，生成方式 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`。已有明文 `data/accounts.json` 会在首次启动时自动迁移，原始文件保留为 `accounts.json.v1.bak`。
-3. **设置 API key**：`.env` 中 `API_KEYS=sk-real-key-1,sk-real-key-2`（多个用逗号分隔）。`ALLOW_UNAUTHENTICATED_API` 保持 `false`。
+3. **设置 API key**：登录 WebUI，在「设置」页创建客户端 Key，并将创建时显示的完整值保存到调用方。Key 哈希保存在 `data/api_keys.sqlite3`；`ALLOW_UNAUTHENTICATED_API` 保持 `false`。
 4. **配置 CORS 白名单**：`ALLOWED_ORIGINS=https://app.example.com`，而不是依赖默认同源策略。
 5. **如果用反向代理**（nginx、Caddy、Traefik）：设置 `TRUSTED_PROXIES=10.0.0.0/8`（你的代理网段）让 admin 限流能正确识别客户端 IP。
 6. **绑定地址**：默认 `127.0.0.1`。如果要走反向代理，保持 loopback；如果直连公网，设置 `HOST=0.0.0.0` 并确保前置有 TLS + WAF。
@@ -673,7 +691,7 @@ Retry-After: 47
 ### 请求生命周期
 
 1. **客户端请求** → `/v1/chat/completions` 收到 OpenAI 格式请求
-2. **模式解析** → `server.py` 根据环境变量和请求参数确定 `model_type` 和 `thinking_enabled`
+2. **能力解析** → `server.py: resolve_model_controls()` 按 `MODEL_ROUTES` → `THINKING`/`SEARCH` → 请求参数的顺序确定 `thinking_enabled` / `search_enabled`（`model_type` 仅作协议字段，恒为 `"default"`）
 3. **DSML 注入** → 如有 `tools`，`build_dsml_tool_prompt()` 生成 DSML 格式系统提示词
 4. **PoW 求解** → `adapter.py` 请求并求解 DeepSeekHashV1 挑战
 5. **会话创建** → 创建新的 DeepSeek Chat 会话（可选复用）
@@ -715,16 +733,17 @@ Retry-After: 47
 
 原因通常是凭证失效或网络问题：
 
-1. 检查 `.env` 中的 `DEEPSEEK_TOKEN` 和 `DEEPSEEK_COOKIES` 是否仍然有效（登录 chat.deepseek.com 重新提取）
+1. 在 WebUI「账号池」检查账号凭证状态；非交互部署则检查 `data/accounts.json` 中的凭证是否仍然有效
 2. 检查能否访问 `chat.deepseek.com`（可能需要代理）
 3. 检查控制台日志中的具体错误信息
 
 ### Q: 流式输出中只有 reasoning_content 没有 content
 
-在 `thinking_mode=true`（专家模式）下，模型会先输出完整的推理过程再输出回答。如果你看到只有推理没有内容：
+在 `thinking_mode=true` 下，模型会先输出完整的推理过程再输出回答。如果你看到只有推理没有内容：
 
 1. 等待模型完成推理（响应尚未结束）
-2. 如果真是 bug：确认服务端版本，检查 `finish_reason` 是否正常输出。已知旧版本可能缺少 `finish_reason: "stop"` 帧
+2. 上游偶尔只回 THINK 片段就结束（实测可复现），此时 `content` 为空但 `finish_reason` 正常，属上游行为，重试即可
+3. 如果真是 bug：确认服务端版本，检查 `finish_reason` 是否正常输出。已知旧版本可能缺少 `finish_reason: "stop"` 帧
 
 ### Q: 如何关闭思维链/推理展示？
 
@@ -732,9 +751,25 @@ Retry-After: 47
 
 ### Q: 一直转圈 / 响应极慢
 
-- 专家模式（`thinking_mode=true`）本身就更慢，模型在做完整推理
+- 开启思考（`thinking_mode=true`）本身就更慢，模型在做完整推理
 - PoW 求解在低性能机器上可能需要数秒
 - 检查网络到 `chat.deepseek.com` 的延迟
+
+### Q: 多轮对话里模型「失忆」，不记得上一轮说的话
+
+先确认调用方式，两种都支持，但要求不同：
+
+| 调用风格 | 要求 | 行为 |
+|---|---|---|
+| 每轮重发完整 `messages`（OpenAI 规范） | 带上 `X-Conversation-Id` 或 `user` 才会复用上游会话 | 第二轮起只把**新增的**那部分发给上游，省 token |
+| 每轮只发**最新一条** user 消息 | 必须带 `X-Conversation-Id` 或 `user` | 复用同一会话与父消息链，整段 prompt 重发一次以补齐上下文 |
+
+排查清单：
+
+1. 是否带了 `X-Conversation-Id`（或 OpenAI 顶层 `user` / Anthropic `metadata.user_id`）？不带就每轮新建会话，必然失忆
+2. 两轮之间是否隔了超过 `SESSION_CACHE_TTL`（默认 1800 秒）？
+3. 是否在流式/非流式之间来回切换？v3.3.8 起两种模式共用同一会话缓存，此前的版本会因此各建一个会话
+4. 日志里出现 `session_prompt_diverged` 是正常提示，表示这一轮走了「保留会话 + 重发全文」的路径
 
 ### Q: Windows 下 curl 请求中文返回 422
 
@@ -797,31 +832,26 @@ DeepSeek 的 Token 有效期不明确。如果遇到 `401` 或 `403` 响应，�
 |------|--------|------|------|
 | `HOST` | `127.0.0.1` | 否 | 监听地址。`0.0.0.0` 配合默认 admin 密码时拒绝启动 |
 | `PORT` | `8080` | 否 | 服务器监听端口 |
-| `API_KEYS` | `""` | 公网部署必填 | 客户端访问 `/v1/*` 的 API Key，支持逗号分隔多个 key |
-| `DEEPSEEK_API_KEY` | `""` | 否 | 单个客户端 API Key 别名 |
 | `ALLOW_UNAUTHENTICATED_API` | `false` | 否 | 是否允许 `/v1/*` 无鉴权访问；公网部署不要开启 |
 | `ALLOW_INSECURE_PUBLIC_DEFAULTS` | `false` | 否 | 显式确认在公网上使用默认密码（不建议） |
 
-### DeepSeek 账号
+客户端 API Key 在 WebUI「设置」页管理，SQLite 文件中只保存哈希。旧版 `.env` 的 `API_KEYS` / `DEEPSEEK_API_KEY` 仅在首次创建 Key 数据库时导入一次；确认客户端已可用后，可从 `.env` 删除旧配置。
+
+### 账号池存储
 
 | 变量 | 默认值 | 必填 | 说明 |
 |------|--------|------|------|
-| `DEEPSEEK_TOKEN` | `""` | 有 DeepSeek 账号时必填 | DeepSeek API 的 Bearer Token（单账号兼容格式） |
-| `DEEPSEEK_COOKIES` | `""` | 有 DeepSeek 账号时必填 | DeepSeek 的 Cookie 值（单账号兼容格式） |
-| `DEEPSEEK_TOKEN_N` | `""` | 否 | 第 N 个 DeepSeek 账号 Token，例如 `DEEPSEEK_TOKEN_1` |
-| `DEEPSEEK_COOKIES_N` | `""` | 否 | 第 N 个 DeepSeek 账号 Cookies |
-| `DEEPSEEK_EMAIL_N` | `"env-N"` | 否 | 第 N 个账号的备注/标识 |
 | `ACCOUNT_STORE_PATH` | `data/accounts.json` | 否 | 面板持久化账号保存路径 |
 
 ### 模型行为
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `MODEL_NAME` | `"deepseek-chat"` | `/v1/models` 默认显示的模型名（`MODEL_ROUTES` 存在时显示路由表） |
-| `MODE` | `"auto"` | `auto` / `quick` / `expert` |
-| `THINKING` | `"auto"` | `auto` / `enabled` / `disabled` |
-| `SEARCH` | `"auto"` | `auto` / `enabled` / `disabled` |
-| `MODEL_ROUTES` | `""` | JSON 路由表，按 `model` 字段切换 `model_type`/thinking/search |
+| `MODEL_NAME` | `"deepseek-chat"` | 本代理服务的**唯一**模型名；`/v1/models` 与 API 响应都用它 |
+| `THINKING` | `"auto"` | `auto` / `enabled` / `disabled` — 控制 `thinking_enabled`（原「专家模式」开关，**这里**决定思考与否） |
+| `SEARCH` | `"auto"` | `auto` / `enabled` / `disabled` — 控制 `search_enabled` |
+| `MODEL_ROUTES` | `""` | 可选高级覆盖：JSON 路由表，把 model 名映射到 thinking/search 能力预设。配置后 `/v1/models` 列出其键；不配置时只列 `MODEL_NAME`，老的 `deepseek-reasoner` 等作为别名照常接受 |
+| `MODE` | `"auto"` | **已废弃**，仅兼容旧配置：`expert` ≡ `THINKING=enabled`，`quick` ≡ `THINKING=disabled` |
 
 ### 管理面板
 
@@ -857,13 +887,6 @@ DeepSeek 的 Token 有效期不明确。如果遇到 `401` 或 `403` 响应，�
 | `DEEPSEEK_JITTER_SECS` | `0.0` | 调用间随机抖动（秒） |
 | `DSML_MAX_BUFFER_BYTES` | `1048576` | StreamSieve 捕获缓冲上限 |
 | `DISABLE_AUTO_RECOVER` | `false` | 设为 true 禁用账号自动恢复 |
-
-### 反检测 — 每个账号的代理
-
-| 变量 | 说明 |
-|------|------|
-| `DEEPSEEK_PROXY` / `DEEPSEEK_PROXY_N` | 单个 / 第 N 个账号的上游代理 URL |
-| `DEEPSEEK_EMAIL` | 旧版单账号格式的邮箱备注 |
 
 ---
 

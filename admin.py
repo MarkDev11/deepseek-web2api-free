@@ -9,7 +9,7 @@ import threading
 import time
 from collections import deque
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from account_pool import AccountPool
@@ -17,6 +17,7 @@ from crypto import is_enabled as crypto_is_enabled, _resolve_key
 from ip_utils import get_real_client_ip, is_trusted_proxy
 from logger import get_logger
 from stats_history import get_history, start_sampler
+from api_key_store import get_api_key_store
 
 log = get_logger("admin")
 
@@ -243,6 +244,10 @@ class AccountReloginResponse(BaseModel):
     message: str
 
 
+class ApiKeyCreateRequest(BaseModel):
+    name: str
+
+
 # ── Router ────────────────────────────────────────────────────
 
 router = APIRouter(prefix="/admin/api")
@@ -301,6 +306,30 @@ async def logout(request: Request):
     return {"ok": True}
 
 
+@router.get("/api-keys")
+async def list_api_keys(request: Request):
+    _check_auth(request)
+    return {"keys": get_api_key_store().list_keys()}
+
+
+@router.post("/api-keys")
+async def create_api_key(req: ApiKeyCreateRequest, request: Request, response: Response):
+    _check_auth(request)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return get_api_key_store().create_key(req.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/api-keys/{key_id}")
+async def revoke_api_key(key_id: str, request: Request):
+    _check_auth(request)
+    if not get_api_key_store().revoke_key(key_id):
+        raise HTTPException(status_code=404, detail="API key not found")
+    return {"ok": True}
+
+
 @router.get("/stats")
 async def stats(request: Request):
     _check_auth(request)
@@ -341,7 +370,7 @@ async def env_info(request: Request):
 
     Powers the React "Settings" page. Intentionally hides secret values
     (only "set / default" indicators for credentials) so a logged-in
-    admin cannot exfiltrate the DeepSeek token via this endpoint.
+    admin cannot expose secret values through this endpoint.
     """
     _check_auth(request)
     pool = _pool
@@ -366,8 +395,6 @@ async def env_info(request: Request):
         "admin_password_set": bool(admin_pwd),
         "admin_password_weak": admin_pwd in {"", "admin", "password", "123456", "changeme"},
         "accounts_total": pool.count(),
-        "accounts_source_env": sum(1 for a in pool.get_all() if a.get("source") == "env"),
-        "accounts_source_file": sum(1 for a in pool.get_all() if a.get("source") == "file"),
         "crypto": {
             "enabled": crypto_on,
             "fernet_configured": bool(_resolve_key()),
@@ -383,12 +410,12 @@ async def env_info(request: Request):
             "per_key": int(os.environ.get("CLIENT_RPM_PER_KEY", "60") or 60),
             "per_ip": int(os.environ.get("CLIENT_RPM_PER_IP", "120") or 120),
         },
-        "session_cache_ttl": int(os.environ.get("SESSION_CACHE_TTL", "600") or 600),
+        "session_cache_ttl": int(os.environ.get("SESSION_CACHE_TTL", "1800") or 1800),
         "log_level": os.environ.get("LOG_LEVEL", "INFO").upper(),
         "log_format": os.environ.get("LOG_FORMAT", "json").lower(),
         "dsml_max_buffer_bytes": int(os.environ.get("DSML_MAX_BUFFER_BYTES", "1048576") or 1048576),
         "uptime_secs": int(time.time() - _stats.start_time),
-        "server_version": "3.2.2",
+        "server_version": "3.3.8",
         "env_overrides": [
             {"name": "HOST", "value": _env("HOST") or "127.0.0.1", "is_default": _flag("HOST") == "default"},
             {"name": "PORT", "value": _env("PORT") or "8080", "is_default": _flag("PORT") == "default"},

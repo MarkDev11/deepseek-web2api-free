@@ -1,10 +1,11 @@
 """
 OpenAI-compatible API proxy for DeepSeek Chat
-Supports streaming, tool calling (via DSML prompt injection), content parts, expert mode.
+Supports streaming, tool calling (via DSML prompt injection), content parts, and
+the thinking / search capabilities (DeepSeek merged its quick and expert modes,
+so ``thinking_enabled`` is the only model-behaviour switch left).
 """
 import json
 import os
-import secrets
 import sys
 import threading
 import time
@@ -37,6 +38,7 @@ from admin import (
     verify_admin_token,
 )
 from stats_history import start_sampler
+from model_router import DEFAULT_MODEL_TYPE
 from tool_dsml import (
     parse_dsml_tool_calls,
     format_tool_calls_for_prompt,
@@ -56,16 +58,29 @@ from token_counter import count_text
 from rate_limiter import RateLimiter
 from ip_utils import get_real_client_ip, is_trusted_proxy
 from model_router import ModelRouter
-from session_cache import SessionCache, ChatSession
+from session_cache import SessionCache, ChatSession, delta_prompt
+from api_key_store import get_api_key_store
 
 load_dotenv()
 configure_from_env()
 log = get_logger("server")
+API_KEY_STORE = get_api_key_store()
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-chat")
+#: Legacy mode knob.  DeepSeek merged quick/expert into a single model (the only
+#: remaining difference is ``thinking_enabled``), so ``MODE`` no longer selects a
+#: model: ``MODE=expert`` is honoured as "default thinking ON" for backward
+#: compatibility with existing .env files, and ``MODE=quick`` as "thinking OFF".
+#: Prefer THINKING=enabled/disabled, which says what it does.
 MODE = os.environ.get("MODE", "auto").strip().lower()
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
 SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
+#: Model names advertised on /v1/models. This proxy serves a **single** model:
+#: whether it thinks is configured server-side (``THINKING``), not selected by
+#: picking a different model name. Legacy names such as ``deepseek-reasoner``
+#: are still accepted as aliases (see ``model_router.LEGACY_MODEL_ALIASES``) but
+#: are not advertised and no longer map to a different behaviour.
+DEFAULT_MODEL_NAMES = [MODEL_NAME]
 HOST = os.environ.get("HOST", "127.0.0.1").strip()
 try:
     PORT = int(os.environ.get("PORT") or "8080")
@@ -81,30 +96,67 @@ ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").spli
 ALLOW_CREDENTIALS = bool(ALLOWED_ORIGINS) and os.environ.get("ALLOW_CORS_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _load_api_keys() -> list[str]:
-    keys = []
-    raw_keys = os.environ.get("API_KEYS", "")
-    for item in raw_keys.split(","):
-        item = item.strip()
-        if item:
-            keys.append(item)
-    single_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if single_key:
-        keys.append(single_key)
-
-    deduped = []
-    seen = set()
-    for key in keys:
-        if key not in seen:
-            seen.add(key)
-            deduped.append(key)
-    return deduped
-
-
-API_KEYS = _load_api_keys()
 RATE_LIMITER = RateLimiter()
-MODEL_ROUTER = ModelRouter()
+MODEL_ROUTER = ModelRouter(models=DEFAULT_MODEL_NAMES)
 SESSION_CACHE = SessionCache()
+
+
+def _legacy_mode_thinking() -> bool | None:
+    """Map the deprecated ``MODE`` knob onto the thinking capability.
+
+    Returns ``None`` when MODE carries no information (``auto`` or unset).
+    """
+    if MODE in {"expert", "thinking", "reasoner"}:
+        return True
+    if MODE in {"quick", "default"}:
+        return False
+    return None
+
+
+def resolve_model_controls(decision, req_thinking: bool = False,
+                           req_search: bool = False) -> tuple[str, bool, bool]:
+    """Resolve ``(model_type, thinking_enabled, search_enabled)`` for a request.
+
+    Precedence, highest first:
+
+    1. ``MODEL_ROUTES`` entry matched by the client's ``model`` name
+       (thinking / search presets).
+    2. ``THINKING`` / ``SEARCH`` env vars when set to enabled/disabled.
+    3. The client's own fields (``thinking_mode`` / ``search_enabled``,
+       or Anthropic's ``thinking`` block mapped by the caller).
+    4. Legacy ``MODE=expert`` / ``MODE=quick`` → thinking on/off.
+
+    ``model_type`` is a protocol field now: the upstream normalises every value
+    to ``"default"`` (verified 2026-10-18), so it is whatever the matching route
+    declares and defaults to ``"default"``.
+    """
+    model_type = decision.model_type or DEFAULT_MODEL_TYPE
+
+    if decision.thinking is not None:
+        thinking = decision.thinking
+    elif THINKING == "enabled":
+        thinking = True
+    elif THINKING == "disabled":
+        thinking = False
+    else:
+        legacy = _legacy_mode_thinking()
+        if legacy is not None:
+            # Deprecated MODE= still wins over the client field so old .env files
+            # keep behaving as they did, but THINKING= is the supported knob.
+            thinking = legacy
+        else:
+            thinking = bool(req_thinking)
+
+    if decision.search is not None:
+        search = decision.search
+    elif SEARCH == "enabled":
+        search = True
+    elif SEARCH == "disabled":
+        search = False
+    else:
+        search = bool(req_search)
+
+    return model_type, thinking, search
 
 
 def _extract_api_key(request: Request) -> str:
@@ -130,11 +182,11 @@ def _check_api_auth(request: Request):
     supplied = _extract_api_key(request)
     if supplied and verify_admin_token(supplied):
         return
-    if not API_KEYS:
+    if not API_KEY_STORE.has_keys():
         raise HTTPException(status_code=503, detail="API key authentication is not configured")
     if not supplied:
         raise HTTPException(status_code=401, detail="Missing API key")
-    if not any(secrets.compare_digest(supplied, key) for key in API_KEYS):
+    if not API_KEY_STORE.verify(supplied):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
@@ -157,7 +209,7 @@ def _check_rate_limit(request: Request) -> dict:
     return headers
 
 
-app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.2.0")
+app = FastAPI(title="DeepSeek Chat API", version="3.3.8")
 
 # ── CORS ─────────────────────────────────────────────────────────────
 # Empty ALLOWED_ORIGINS ⇒ same-origin only. We deliberately do NOT set
@@ -213,7 +265,7 @@ if os.environ.get("VERCEL") != "1":
 if pool.count() == 0:
     log.warning(
         "no_accounts_in_pool",
-        extra={"hint": "Set DEEPSEEK_TOKEN and DEEPSEEK_COOKIES in .env"},
+        extra={"hint": "Add an account in the WebUI or data/accounts.json"},
     )
 
 
@@ -326,7 +378,8 @@ class ChatCompletionRequest(BaseModel):
     # OpenAI's top-level end-user identifier.  It is used only as one part of
     # an opaque, caller-scoped upstream-session cache key.
     user: Optional[str] = None
-    # Expert mode
+    # Capability switches (NOT a model selector): thinking_mode → upstream
+    # thinking_enabled, search_enabled → upstream search_enabled.
     thinking_mode: Optional[bool] = False
     search_enabled: Optional[bool] = False
 
@@ -381,32 +434,56 @@ class AcquiredAccount:
         return ds_id
 
     def prepare_prompt(self, full_prompt: str) -> str:
-        """Return the prompt to send upstream.
+        """Return the prompt to send upstream for this turn.
 
-        On a reused cached session this may be an incremental *tail* (only
-        the new user turn) via ``delta_prompt`` — the parent chain keeps the
-        context server-side. Resending the full history on every turn would
-        make the DeepSeek conversation embed previous turns repeatedly
-        (quadratic growth, bot-spam signature).
+        Three cases, decided by ``session_cache.delta_prompt``:
 
-        Call *before* ``create_session()``: when the history diverges from
-        what was previously sent, the cached session is invalidated so the
-        next ``create_session()`` starts a fresh chain.
+        * **Exact replay** — the client retried the same turn: send it again.
+        * **Continuation** — the client resends the whole history and it grew:
+          send only the new tail. The parent chain carries the earlier context
+          server-side, which keeps the DeepSeek conversation from embedding every
+          previous turn again (quadratic growth / bot-spam signature).
+        * **Divergent history** — the client only sent the newest message, or
+          edited/truncated the history: send the *full* prompt **on the existing
+          session and parent chain**.
+
+        That last case used to invalidate the cached session, which silently threw
+        away the upstream conversation: a client that sends only the new user
+        message per turn ("我叫什么名字？") got a brand-new session with no
+        context, so the model answered as if the conversation had never happened.
+        Reusing the chain and resending the whole prompt costs a few extra tokens
+        once but keeps the conversation intact — verified against the live
+        upstream.
+
+        Call *before* ``create_session()``.
         """
         cached = self._cached_session
-        if self._cache_key and cached is not None and cached.sent_prompt:
-            prev = cached.sent_prompt
-            if full_prompt.startswith(prev) and full_prompt != prev:
-                tail = full_prompt[len(prev):].lstrip("\n ")
-                if tail:
-                    return tail
-            if not full_prompt.startswith(prev):
-                # Divergent history — abandon the cached chain entirely
-                # instead of duplicating it under a mismatched parent.
-                SESSION_CACHE.invalidate(self._cache_key)
-                self._cached_session = None
-                self._parent_message_id = None
-        return full_prompt
+        if cached is None or not (self._cache_key and cached.sent_prompt):
+            return full_prompt
+
+        delta = delta_prompt(cached.sent_prompt, full_prompt)
+        if delta is None:
+            # Divergent history: keep the session, resend everything. The reply
+            # to *this* turn is still appended to the same upstream thread, so
+            # the next turn gets its context back.
+            cached.diverged_turns += 1
+            cached.sent_prompt = full_prompt
+            log.info(
+                "session_prompt_diverged",
+                extra={
+                    "session_id": cached.chat_session_id,
+                    "account_id": self.acct.id,
+                    "diverged_turns": cached.diverged_turns,
+                    "prompt_chars": len(full_prompt),
+                },
+            )
+            return full_prompt
+        if delta != full_prompt:
+            log.debug(
+                "session_prompt_delta",
+                extra={"session_id": cached.chat_session_id, "delta_chars": len(delta)},
+            )
+        return delta
 
     @property
     def session_id(self) -> str:
@@ -500,9 +577,25 @@ def _cache_scope(request: Request) -> str:
     return f"ip:{_client_ip(request)}"
 
 
-def _cache_key(request: Request, mode: str, conversation_id: str | None) -> str | None:
+def _cache_key(request: Request, conversation_id: str | None,
+               mode_conversation_id: str | None = None) -> str | None:
+    """Return the session-cache key for one conversation.
+
+    One namespace per conversation: stream and non-stream turns of the same
+    conversation share a cache entry, so flipping ``stream`` mid-thread no longer
+    starts a fresh upstream session.  (The old ``stream:``/``nonstream:`` split
+    existed to dodge an empty response when a streamed session was reused
+    non-streamed; keeping the parent chain plus the existing empty-response retry
+    covers that case without losing the conversation.)
+
+    Legacy 3-argument calls ``_cache_key(request, mode, conversation_id)`` are
+    still accepted — ``mode`` is then ignored — so out-of-tree callers and older
+    tests keep working.
+    """
+    if mode_conversation_id is not None:
+        conversation_id = mode_conversation_id
     derived = SessionCache.derive_cache_key(_cache_scope(request), conversation_id)
-    return f"{mode}:{derived}" if derived else None
+    return f"conv:{derived}" if derived else None
 
 
 def _extract_openai_user(req: ChatCompletionRequest, request: Request) -> str | None:
@@ -666,7 +759,8 @@ async def health():
 async def list_models(request: Request):
     _check_api_auth(request)
     rate_headers = _check_rate_limit(request)
-    # Surface every model declared in MODEL_ROUTES; fall back to MODEL_NAME.
+    # One model only. MODEL_ROUTES is an optional advanced override for per-name
+    # capability presets; when it is set its names are what clients can ask for.
     names = MODEL_ROUTER.models or [MODEL_NAME]
     return JSONResponse(
         ModelList(data=[
@@ -683,48 +777,25 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     proxy_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     prompt = _build_prompt(req.messages, req.tools, req.tool_choice)
 
-    # Resolve model_type / thinking / search from MODEL_ROUTES first, then
-    # MODE/THINKING/SEARCH env vars, then the per-request fields.
+    # Resolve model_type / thinking / search.  There is no quick-vs-expert model
+    # any more: the upstream serves one model and normalises model_type to
+    # "default"; the capabilities live in thinking_enabled / search_enabled.
     decision = MODEL_ROUTER.route_for(req.model)
+    model_type, thinking, search = resolve_model_controls(
+        decision, req_thinking=bool(req.thinking_mode), req_search=bool(req.search_enabled)
+    )
 
-    # MODE controls model_type (quick → "default", expert → "expert")
-    if decision.matched_model:
-        model_type = decision.model_type
-    elif MODE == "expert":
-        model_type = "expert"
-    else:
-        model_type = "default"  # quick mode or auto, matches native request format
-
-    # THINKING controls thinking_enabled independent of mode
-    if decision.thinking is not None:
-        thinking = decision.thinking
-    elif THINKING == "enabled":
-        thinking = True
-    elif THINKING == "disabled":
-        thinking = False
-    else:
-        thinking = req.thinking_mode or False
-
-    # SEARCH controls search_enabled independently
-    if decision.search is not None:
-        search = decision.search
-    elif SEARCH == "enabled":
-        search = True
-    elif SEARCH == "disabled":
-        search = False
-    else:
-        search = req.search_enabled or False
-
-    # Session cache keys are mode-scoped: reusing a session created by a
-    # streamed call from a non-streaming call (or vice versa) makes the
-    # upstream return an empty response. Same-mode multi-turn still works.
+    # One cache namespace per conversation: switching stream mode mid-thread must
+    # not silently start a brand-new upstream session (it used to, because the
+    # key was prefixed with stream:/nonstream:).
     openai_user = _extract_openai_user(req, request)
+    cache_key = _cache_key(request, openai_user)
     if req.stream:
         return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search, rate_headers=rate_headers,
-                                    cache_key=_cache_key(request, "stream", openai_user))
+                                    cache_key=cache_key)
 
     return _handle_nonstream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search,
-                             cache_key=_cache_key(request, "nonstream", openai_user))
+                             cache_key=cache_key)
 
 
 # ---- Anthropic /v1/messages endpoint ----
@@ -748,37 +819,13 @@ async def messages(req: AnthropicRequest, request: Request):
         system_str=system_str,
     )
 
-    # Resolve model_type / thinking / search from MODEL_ROUTES first, then
-    # MODE/THINKING/SEARCH env vars, then the per-request fields.
+    # Resolve model_type / thinking / search — same rules as the OpenAI endpoint
+    # (Anthropic's thinking block is the request-level thinking signal).
     decision = MODEL_ROUTER.route_for(req.model)
-
-    # MODE controls model_type
-    if decision.matched_model:
-        model_type = decision.model_type
-    elif MODE == "expert":
-        model_type = "expert"
-    else:
-        model_type = "default"
-
-    # THINKING — Anthropic thinking param maps to thinking_mode
-    if decision.thinking is not None:
-        thinking = decision.thinking
-    elif THINKING == "enabled":
-        thinking = True
-    elif THINKING == "disabled":
-        thinking = False
-    else:
-        thinking = (req.thinking is not None and req.thinking.type == "enabled") or False
-
-    # SEARCH
-    if decision.search is not None:
-        search = decision.search
-    elif SEARCH == "enabled":
-        search = True
-    elif SEARCH == "disabled":
-        search = False
-    else:
-        search = False
+    req_thinking = bool(req.thinking is not None and req.thinking.type == "enabled")
+    model_type, thinking, search = resolve_model_controls(
+        decision, req_thinking=req_thinking, req_search=False
+    )
 
     tool_names = []
     if req.tools:
@@ -787,17 +834,18 @@ async def messages(req: AnthropicRequest, request: Request):
                 tool_names.append(t.name)
 
     anth_user = _extract_anthropic_user(req, request)
+    cache_key = _cache_key(request, anth_user)
     if req.stream:
         return await _anthropic_stream(proxy_id, prompt, tool_names,
                                        model_type=model_type, thinking_mode=thinking,
                                        search_enabled=search,
                                        rate_headers=rate_headers,
-                                       cache_key=_cache_key(request, "stream", anth_user))
+                                       cache_key=cache_key)
 
     return _anthropic_nonstream(proxy_id, prompt, tool_names,
                                 model_type=model_type, thinking_mode=thinking,
                                 search_enabled=search,
-                                cache_key=_cache_key(request, "nonstream", anth_user))
+                                cache_key=cache_key)
 
 
 def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
@@ -995,6 +1043,18 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             },
         }
 
+    # Mirror the streaming path: when thinking was on and the model produced a
+    # reasoning chain, expose it as `reasoning_content` (the same non-standard
+    # field DeepSeek's own API and the streaming branch use). It used to be
+    # collected and then dropped here, so `thinking_mode=true` + `stream=false`
+    # silently lost the chain while `stream=true` emitted it.
+    message: dict = {
+        "role": "assistant",
+        "content": cleaned or content,
+    }
+    if thinking:
+        message["reasoning_content"] = thinking
+
     return {
         "id": proxy_id,
         "object": "chat.completion",
@@ -1002,10 +1062,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         "model": MODEL_NAME,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": cleaned or content,
-            },
+            "message": message,
             "finish_reason": "stop",
         }],
         "usage": {
@@ -1021,7 +1078,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                          thinking_mode: bool = False, search_enabled: bool = False,
                          rate_headers: dict | None = None,
                          cache_key: str | None = None):
-    """Streaming completion with StreamSieve tool call detection and expert mode support."""
+    """Streaming completion with StreamSieve tool call detection and thinking support."""
     prompt_tokens = count_text(prompt)
     acq = _acquire(cache_key=cache_key)
     try:

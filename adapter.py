@@ -33,9 +33,7 @@ from logger import get_logger
 load_dotenv()
 log = get_logger("adapter")
 
-COOKIES = os.environ.get("DEEPSEEK_COOKIES", "")
 BASE_URL = "https://chat.deepseek.com"
-TOKEN = os.environ.get("DEEPSEEK_TOKEN", "")
 IMPERSONATE = os.environ.get("DEEPSEEK_IMPERSONATE", "chrome131")
 try:
     JITTER_SECS = max(0.0, float(os.environ.get("DEEPSEEK_JITTER_SECS", "0.4") or 0))
@@ -275,7 +273,7 @@ class DeepSeekAdapter:
         '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
     )
 
-    def __init__(self, token: str = TOKEN, cookies: str = COOKIES,
+    def __init__(self, token: str, cookies: str,
                  impersonate: str = IMPERSONATE, proxy: str | None = None):
         self.token = self._normalize_token(token)
         self.cookies = cookies
@@ -740,15 +738,21 @@ class DeepSeekAdapter:
             # thinking replies arriving as "arta" instead of "Jakarta").
             if p == "response/fragments" and o == "APPEND":
                 if isinstance(v, list) and v:
-                    new_type = v[0].get('type', '')
+                    frag = v[0]
+                    new_type = frag.get('type', '')
                     if new_type == 'RESPONSE':
                         frag_type = 'content'
                     elif new_type == 'THINK':
                         frag_type = 'thinking'
-                    fc = v[0].get('content', '')
-                    if fc:
+                    # A short answer can arrive entirely inside the APPEND that
+                    # introduces the RESPONSE fragment (observed for
+                    # "1+1=? 只回答数字" with thinking on: the frame carries
+                    # content="2" and there is no follow-up content token).
+                    # Without this the non-stream path returned an empty answer.
+                    seed = frag.get('content', '')
+                    if seed:
                         (thinking_parts if frag_type == 'thinking'
-                         else content_parts).append(fc)
+                         else content_parts).append(seed)
                 continue
 
             # Normal mode

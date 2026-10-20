@@ -44,7 +44,7 @@ export function AccountDetailDrawer({ account, onClose, onRelogin }: Props) {
                 <span className="flex items-center gap-2">
                   <StateBadge state={account.state} />
                   <span className="text-xs text-muted-foreground">·</span>
-                  <span className="text-xs">{account.source === 'env' ? 'env read-only' : 'Persistent'}</span>
+                  <span className="text-xs">Persistent</span>
                 </span>
               </SheetDescription>
             </SheetHeader>
@@ -54,9 +54,8 @@ export function AccountDetailDrawer({ account, onClose, onRelogin }: Props) {
                 <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Identity</h3>
                 <DetailRow label="ID" value={account.id} mono copyable />
                 <DetailRow label="Email" value={account.email || '—'} />
-                <DetailRow label="Source" value={account.source} />
+                <DetailRow label="Source" value="data/accounts.json" />
                 <DetailRow label="Status" value={account.state} />
-                <DetailRow label="Editable" value={account.read_only ? 'No (read-only)' : 'Yes'} />
               </section>
 
               <Separator />

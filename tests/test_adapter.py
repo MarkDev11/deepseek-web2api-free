@@ -103,6 +103,67 @@ class TestHintScanning:
         assert toast[1] == "unsupported_client_by_model"
 
 
+# ── non-stream fragment parsing with thinking enabled ─────────
+
+class TestNonStreamFragments:
+    """Regression: a short answer can arrive entirely inside the
+    `response/fragments APPEND` frame that introduces the RESPONSE fragment.
+
+    Observed live for "1+1=? 只回答数字" with thinking on: the stream is
+    THINK tokens → `{"p":"response/fragments","o":"APPEND","v":[{"type":"RESPONSE","content":"2"}]}`
+    → FINISHED, with no follow-up content token. The non-stream parser used
+    to ignore that seed content and returned an empty answer.
+    """
+
+    _SSE = (
+        "event: ready\n"
+        "data: {\"request_message_id\":1,\"response_message_id\":2,"
+        "\"model_type\":\"default\"}\n\n"
+        "data: {\"v\":{\"response\":{\"message_id\":2,\"status\":\"WIP\","
+        "\"thinking_enabled\":true,\"fragments\":[{\"id\":2,\"type\":\"THINK\","
+        "\"content\":\"用户问 1+1\"}]}}}\n\n"
+        "data: {\"v\":\"，答案是 2。\"}\n\n"
+        "data: {\"p\":\"response/fragments\",\"o\":\"APPEND\","
+        "\"v\":[{\"id\":3,\"type\":\"RESPONSE\",\"content\":\"2\","
+        "\"references\":[],\"stage_id\":1}]}\n\n"
+        "data: {\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}\n\n"
+        "event: close\ndata: {}\n\n"
+    )
+
+    def test_answer_inside_fragment_append_is_not_lost(self, monkeypatch):
+        ad = _adapter()
+        monkeypatch.setattr(ad, "_send_completion",
+                            lambda *a, **k: _FakeResp(self._SSE))
+        content, thinking = ad.chat("sess-1", "prompt", thinking_enabled=True)
+        assert content == "2"
+        assert "用户问 1+1" in thinking
+        assert "答案是 2。" in thinking
+
+    def test_thinking_text_stays_out_of_content(self, monkeypatch):
+        ad = _adapter()
+        monkeypatch.setattr(ad, "_send_completion",
+                            lambda *a, **k: _FakeResp(self._SSE))
+        content, _ = ad.chat("sess-1", "prompt", thinking_enabled=True)
+        assert "1+1" not in content
+
+    def test_fragment_append_without_seed_content_still_streams_tokens(self, monkeypatch):
+        """The common long-answer shape: bare fragment switch, then tokens."""
+        ad = _adapter()
+        sse = (
+            "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n"
+            "data: {\"v\":{\"response\":{\"fragments\":[{\"type\":\"THINK\",\"content\":\"想\"}]}}}\n\n"
+            "data: {\"p\":\"response/fragments\",\"o\":\"APPEND\","
+            "\"v\":[{\"id\":3,\"type\":\"RESPONSE\",\"content\":\"\"}]}\n\n"
+            "data: {\"v\":\"你\"}\n\n"
+            "data: {\"v\":\"好\"}\n\n"
+            "data: {\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}\n\n"
+        )
+        monkeypatch.setattr(ad, "_send_completion", lambda *a, **k: _FakeResp(sse))
+        content, thinking = ad.chat("sess-1", "prompt", thinking_enabled=True)
+        assert content == "你好"
+        assert thinking == "想"
+
+
 # ── chat() non-streaming retry ────────────────────────────────
 
 class TestChatRetry:

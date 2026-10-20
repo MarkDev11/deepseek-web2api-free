@@ -28,10 +28,21 @@ interface ApiMessage {
   content: string
 }
 
-/** Display labels for the model dropdown — mark the quick/expert modes. */
+/**
+ * Display labels for the model dropdown.
+ *
+ * DeepSeek merged its quick/expert modes: the upstream serves ONE chat model
+ * and normalises `model_type` to "default". This proxy therefore serves a
+ * single model too — /v1/models lists just MODEL_NAME — and whether it thinks
+ * is configured server-side with THINKING (=auto/enabled/disabled).
+ *
+ * The dropdown still exists because the `model` field must be sent, and because
+ * an operator may declare extra names via MODEL_ROUTES; the labels below only
+ * decorate the two default names when they are present.
+ */
 const MODEL_LABELS: Record<string, string> = {
-  'deepseek-chat': 'deepseek-chat (quick / default)',
-  'deepseek-reasoner': 'deepseek-reasoner (expert)',
+  'deepseek-chat': 'deepseek-chat (the only model)',
+  'deepseek-reasoner': 'deepseek-reasoner (legacy alias of deepseek-chat)',
 }
 
 export default function PlaygroundPage() {
@@ -40,8 +51,10 @@ export default function PlaygroundPage() {
 
   // Request parameters — these map to the fields the backend actually
   // forwards to DeepSeek (see server.py / adapter.py):
-  //   model          -> MODEL_ROUTES may map it to model_type (default/expert)
-  //   thinking_mode  -> DeepSeek thinking_enabled
+  //   model          -> must be sent, but it does NOT select a different
+  //                     upstream model: there is only one (MODEL_NAME). Names
+  //                     declared in MODEL_ROUTES only preselect capabilities.
+  //   thinking_mode  -> DeepSeek thinking_enabled  ← the real "expert" switch
   //   search_enabled -> DeepSeek search_enabled
   // temperature / top_p / max_tokens are ignored by the backend, so they
   // are intentionally not offered here.
@@ -198,7 +211,7 @@ export default function PlaygroundPage() {
     <div className="space-y-4 animate-fade-in h-full flex flex-col">
       <PageHeader
         title="Playground"
-        description="Live test /v1/chat/completions (requires API_KEYS in .env)"
+        description="Test /v1/chat/completions live"
         actions={
           <Button
             variant="outline"
@@ -225,8 +238,10 @@ export default function PlaygroundPage() {
               <Label>Model</Label>
               <ModelSelector value={model} onChange={setModel} labels={MODEL_LABELS} />
               <p className="text-[11px] text-muted-foreground">
-                Mapped to DeepSeek via <code className="font-mono">MODEL_ROUTES</code>
-                <code className="font-mono"> model_type</code> (default / expert)
+                There is only one model; the name is only used for{" "}
+                <code className="font-mono">/v1/models</code> and{" "}
+                <code className="font-mono">MODEL_ROUTES</code> preset matching. Whether it thinks
+                is decided by the switch below (or the server-side <code className="font-mono">THINKING</code>).
               </p>
             </div>
 
@@ -247,9 +262,14 @@ export default function PlaygroundPage() {
                 <Label htmlFor="thinking">Thinking mode</Label>
                 <p className="text-[11px] text-muted-foreground">
                   Maps to DeepSeek <code className="font-mono">thinking_enabled</code>
+                  , i.e. the former "expert mode"
                 </p>
               </div>
-              <Switch id="thinking" checked={thinking} onCheckedChange={setThinking} />
+              <Switch
+                id="thinking"
+                checked={thinking}
+                onCheckedChange={setThinking}
+              />
             </div>
 
             <div className="flex items-center justify-between">
@@ -267,10 +287,11 @@ export default function PlaygroundPage() {
                 <Info className="h-3.5 w-3.5" />
                 Parameter precedence
               </p>
-              <p>· Server .env MODE / THINKING / SEARCH take precedence over these settings</p>
-              <p>· MODE=expert always uses expert mode (model_type=expert)</p>
-              <p>· THINKING/SEARCH force the toggle on/off when set to enabled/disabled</p>
-              <p>· temperature / top_p / max_tokens are not supported by the backend and are not exposed</p>
+              <p>· Server-side .env THINKING / SEARCH take precedence over these settings</p>
+              <p>· There is only one model; thinking is toggled by this switch + THINKING, not by switching model names</p>
+              <p>· THINKING / SEARCH force the toggles on/off when set to enabled/disabled</p>
+              <p>· Legacy MODE=expert / MODE=quick are still accepted, equivalent to THINKING=enabled / disabled</p>
+              <p>· temperature / top_p / max_tokens have no backend effect and are not exposed</p>
             </div>
           </CardContent>
         </Card>

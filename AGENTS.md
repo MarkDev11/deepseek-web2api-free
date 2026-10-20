@@ -2,7 +2,44 @@
 
 > 本文档面向后续维护本项目的 AI 智能体，完整阐述项目的实现原理、协议细节、代码架构和已知问题。**请先全文阅读本文档再开始任何修改**。
 
+## 当前账号配置规则
+
+- 账号凭证只通过 WebUI 账号池或 `data/accounts.json` 配置；WebUI 的修改会持久化到该 JSON 文件。
+- `.env` 中的 `DEEPSEEK_TOKEN`、`DEEPSEEK_COOKIES`、`DEEPSEEK_EMAIL`、`DEEPSEEK_PROXY` 及编号形式不再读取；池空时不会使用环境变量兜底。
+- 以下版本记录保留当时的实现历史；其中曾描述的 `.env` 账号兜底已经移除。
+
 ---
+
+## v3.3.8（2026-10-18）：单模型收敛 + 多轮上下文修复
+
+> 本节描述**当前事实**（不是待办）。完整变更见 [docs/release-notes/v3.3.8.md](docs/release-notes/v3.3.8.md)。
+
+**上游证据（2026-10-18，真实 HAR 抓包 + 实时请求）**
+
+- `GET /api/v0/client/settings?scope=model` 返回 `{"model_type":"default","name":"快速模式","enabled":true,"switchable":true}`、`{"model_type":"expert","name":"专家模式","enabled":false,"switchable":false}`、`{"model_type":"vision","name":"识图模式","enabled":false,"switchable":false}`——只有 `default` 可用、可切换。
+- 上游把请求体里的 `model_type` 一律改写回 `"default"`：客户端发 `"model_type":"expert"` 时，`event: ready` 帧仍回 `{"model_type":"default"}`。
+- A/B 实测（同一 prompt，各 3 次）：`model_type=default` 与 `expert` 正文**逐字相同**（24/24/24 字）；耗时中位数 4.01s vs 4.65s（噪声范围）。DSML 工具调用在两者下都成功解析出同样的 `get_weather` 调用。
+- HAR 里 7 个 completion 请求体全部是 `"model_type":"default"`——浏览器早就不发 `expert` 了。
+- **结论**：原「快速模式 / 专家模式」的能力差异只剩 `thinking_enabled`（是否输出推理）；`model_type` 退化为**协议字段**。
+
+**代码改动**
+
+1. **`model_router.py` 语义重写**：新增 `DEFAULT_MODEL_TYPE = "default"`，`model_type` 降级为协议字段；route 字符串简写变为**能力预设**——`"default"`/`"quick"`=关闭思考，`"thinking"`/`"expert"`/`"reasoner"`=开启思考（`quick`/`expert` 保留为旧配置兼容别名）；dict 形式仍可显式指定 `model_type`（为上游将来放开 `vision` 之类留口子）。新增 `ModelRouter(models=[...])` 参数，用于 `/v1/models` 回落。
+2. **`server.py` 新增 `resolve_model_controls(decision, req_thinking, req_search) -> (model_type, thinking, search)`**：统一原先在 OpenAI 与 Anthropic 两处重复的决策代码。优先级：`MODEL_ROUTES` → `THINKING`/`SEARCH` → 客户端字段 → 旧 `MODE`（`expert`≡thinking on、`quick`≡thinking off、`auto` 不介入）。
+3. **单模型：`/v1/models` 只列一个名字**。`DEFAULT_MODEL_NAMES = [MODEL_NAME]`（不再追加 `deepseek-reasoner`）。旧名字（`deepseek-reasoner` 等）经 `model_router.LEGACY_MODEL_ALIASES` + `canonical_model_name()` 归一到 `MODEL_NAME`——继续被接受（老 SDK 不 404），但**不再改变行为**、也不出现在 `/v1/models` 里。「思考 / 不思考」不是两个模型，而是 `THINKING`（或请求的 `thinking_mode`）。`MODEL_ROUTES` 降级为**可选高级覆盖**：不配置时 `/v1/models` 只列 `MODEL_NAME`；配置时列它的键。`.env.example` 里的默认 `MODEL_ROUTES` 已移除。
+4. **缓存键合并**：`_cache_key(request, conversation_id, mode_conversation_id=None)`——流式与非流式共用同一 `conv:<sha256>` 命名空间，不再有 `stream:`/`nonstream:` 前缀（原先是为规避「流式会话被非流式复用 → 空响应」；现在靠 parent 链维护 + 空响应重试覆盖）。旧的 3 参数位置写法仍兼容（第 2 个参数被当作 mode 忽略、第 3 个当作 conversation_id）。
+5. **多轮失忆修复**：`AcquiredAccount.prepare_prompt()` 借助 `session_cache.delta_prompt()` 分三支——完全重复 → 原样重发；历史一致延伸 → 只发新增尾部；**历史发散 → 保留会话与 `parent_message_id` 链、重发完整 prompt**。此前是 `SESSION_CACHE.invalidate()` + 丢弃会话，导致「每轮只发最新一条消息」的客户端模型失忆。发散时累加 `ChatSession.diverged_turns` 并打 `session_prompt_diverged` INFO 日志（详见 §5.6）。
+6. **`session_cache.ChatSession` 新增字段 `diverged_turns: int = 0`**。
+7. **管理后台**：`/admin/api/env` 的 `session_cache_ttl` 回落值 600 → 1800，与 `session_cache.SESSION_CACHE_TTL` 实际默认值一致（修掉面板显示与真实值漂移）。
+8. **FastAPI 元信息**：`title`/`version` 由 `"DeepSeek Chat API (Expert Preview)"` / `"2.2.0"` 改为 `"DeepSeek Chat API"` / `"3.3.8"`。
+9. **测试**：`tests/test_model_router.py` 重写；新增 `tests/test_multiturn_context.py`（覆盖发散保留会话、增量 prompt 仍生效、缓存键合并、能力解析优先级）与 `tests/test_nonstream_reasoning.py`（非流式必须回传 `reasoning_content`，见第 11 条）；`scripts/run_e2e.py` 的 `MODEL_ROUTES` 示例同步。测试总数 103 → 130（全绿）。
+10. **前端 `webui-new`**：Playground 模型下拉只标注「deepseek-chat（唯一模型）」，不再把两个名字呈现为「直接回答 / 启用思考」两种模型；选择模型不再联动思考开关（开关本身就是唯一的思考控制），参数说明改为「只有一个模型，是否思考由开关或服务端 `THINKING` 决定」。
+11. **非流式丢推理链修复**：`_handle_nonstream()` 取了 `adapter.chat()` 的 `thinking` 却从未写进响应体，于是 `thinking_mode=true` + `stream=false` 拿不到 `reasoning_content`（同 prompt 流式却有 100+ 字）。现在 `thinking` 非空时补 `message["reasoning_content"]`，为空时不加该键；tool_calls 分支不变。Anthropic 侧本来就传了 `thinking_text`，无需改。
+
+**兼容与迁移**
+
+- `.env` 里的旧 `MODEL_ROUTES`（`"quick"`/`"expert"` 简写）与旧 `MODE=quick|expert` 继续可用，但都不再影响 `model_type`；新配置请写 `"default"`/`"thinking"`，或用 `THINKING`/`MODEL_ROUTES`。
+- 详细语义见 §7（模型能力控制）、§5.6（多轮 prompt 组装）、§10.6（模型名回落）、§14（配置系统）。
 
 ## v3.3.4（2026-09-10）：Anthropic 非流式错误映射
 
@@ -59,7 +96,7 @@
 - **hif 签名头发送**：`_HifProvider` 拉取 `hif-leim/hif-dliq.deepseek.com/query`（`data.biz_data.value`，`x-hif-ttl` 缓存默认 600s），completion 请求附加 `X-Hif-Leim/Dliq`（create_session 不带）；失败静默降级（不加头）
 - **测试覆盖**：`tests/test_adapter.py`（15 用例，hint/toast/空响应重试/退避/hif）+ `tests/test_account_pool.py`（10 用例，env 兜底/池空/只读保护/持久化），全套 81 测试
 - 流式 toast/hint 检测修复：上游错误 data 为顶层 dict（非 `v` 包装），两者均检查
-- **SESSION_CACHE 模式隔离**：缓存 key 按流式/非流式区分（`stream:`/`nonstream:`），修复"流式创建 session 被非流式复用 → 空响应"；限流/空响应时 `invalidate` 缓存（失败一次后自愈）
+- **SESSION_CACHE 模式隔离**：缓存 key 按流式/非流式区分（`stream:`/`nonstream:`），修复"流式创建 session 被非流式复用 → 空响应"；限流/空响应时 `invalidate` 缓存（失败一次后自愈）（该行为已于 v3.3.8 变更，见上）
 - **已知遗留 → 已修复（v3.2.3）**：同模式多轮复用 session 第二次请求 parent 错误导致的空响应，已通过 SSE `ready` 事件提取 `response_message_id` 维护 parent 链解决（见 v3.2.3 摘要）
 
 ### v3.2.0（2026-08-02）：维护版本
@@ -105,7 +142,7 @@
 4. [PoW 反爬机制](#4-pow-反爬机制)
 5. [会话管理](#5-会话管理)
 6. [SSE 协议格式](#6-sse-协议格式)
-7. [专家模式 (Expert Mode)](#7-专家模式-expert-mode)
+7. [模型能力控制（MODEL_ROUTES / THINKING / SEARCH）](#7-模型能力控制model_routes--thinking--search)
 8. [工具调用 (DSML)](#8-工具调用-dsml)
 9. [StreamSieve 流式筛分引擎](#9-streamsieve-流式筛分引擎)
 10. [OpenAI 兼容层](#10-openai-兼容层)
@@ -131,7 +168,7 @@
 - DeepSeek 官方 API 需要付费且对非中国大陆用户受限
 - DeepSeek Chat 网页版免费但使用其私有协议，不兼容 OpenAI SDK
 - 网页版有 PoW（Proof of Work）反爬机制，需要自动求解
-- DeepSeek 提供"快速模式"和"专家模式"两种对话能力，接口行为不同
+- DeepSeek 网页版有「快速模式 / 专家模式」两种 UI 模式，但上游已于 2026-10 把两者合并（`model_type` 被一律改写为 `"default"`，见 v3.3.8 小节与 §7.6）。本项目因此**只服务一个模型**：`/v1/models` 只列 `MODEL_NAME`，是否输出推理由 `.env` 的 `THINKING` 决定（旧名 `deepseek-reasoner` 等仅作别名）
 
 ### 1.2 核心能力
 
@@ -141,23 +178,27 @@
 | Anthropic 兼容接口 | ✅ | `/v1/messages` — Anthropic Claude API 格式 |
 | 流式输出 (SSE) | ✅ | OpenAI chunk 格式 + Anthropic SSE 格式 |
 | 非流式输出 | ✅ | 完整响应 |
-| 多轮对话 | ✅ | 客户端通过 messages 数组管理上下文 |
-| 普通对话 | ✅ | 快速模式 |
-| 专家模式 | ✅ | DeepSeek 推理模型，含 thinking tokens |
+| 多轮对话 | ✅ | 客户端通过 messages 数组管理上下文；服务端另有 `SESSION_CACHE_TTL`（默认 1800s）会话缓存 + 增量 prompt（§5.6） |
+| 直接回答（快速模式） | ✅ | 上游 `model_type="default"`——2026-10 起**唯一**可用、可切换的上游模式 |
+| 专家模式 | ⚠️ | 已与快速模式合并（2026-10-18 实测）：`model_type="expert"` 被上游改写为 `"default"`，能力差异只剩 `thinking_enabled`（§7.6） |
 | 工具调用 | ✅ | 基于 DSML 提示词注入（非原生） |
 | ContentPart 数组 | ✅ | content 支持 str 和 array 格式 |
 | PoW 自动求解 | ✅ | WASM 本地求解，0.1-0.3s |
-| 会话管理 | ✅ | 每次请求新建 DeepSeek 会话 |
+| 会话管理 | ✅ | 有显式会话标识时复用上游会话 + parent 链；否则每轮新建（§5.1/§5.6） |
 | 联网搜索 | ⚠️ | 参数透传，行为取决于 DeepSeek 服务端 |
-| MODE 环境变量控制 | ✅ | 通过 `.env` 强制模式：`auto`/`quick`/`expert` |
+| 单模型（v3.3.8） | ✅ | 只服务一个模型：`/v1/models` 只列 `MODEL_NAME`；「思考 / 不思考」由 `THINKING` 决定，不是两个模型 |
+| 旧模型名别名（`LEGACY_MODEL_ALIASES`） | ✅ | `deepseek-reasoner` 等旧名归一到 `MODEL_NAME`，仍被接受但**不改变行为**、不出现在 `/v1/models` |
+| 能力预设覆盖（`MODEL_ROUTES`，可选） | ✅ | 仅作为高级覆盖：配置后 `/v1/models` 列出其键，按 model 名映射 thinking/search 预设 |
+| MODE 环境变量控制 | ⚠️ | **已降级**（v3.3.8）：`expert`≡开启思考、`quick`≡关闭思考，不再改 `model_type`；新配置用 `THINKING`/`MODEL_ROUTES` |
 | THINKING 环境变量控制 | ✅ | 通过 `.env` 强制思考：`auto`/`enabled`/`disabled` |
 | SEARCH 环境变量控制 | ✅ | 通过 `.env` 强制联网搜索：`auto`/`enabled`/`disabled` |
-| model_type 与 thinking_enabled 解耦 | ✅ | 两者独立，所有 4 种组合均有效 |
+| model_type 与 thinking_enabled 解耦 | ✅ | 已解耦到底：`model_type` 退化为协议字段（恒 `"default"`），能力由 thinking/search 决定 |
 | finish_reason SSE 结束帧 | ✅ | 流式响应末尾发送 `delta: {}, finish_reason: "stop"` |
 
 ### 1.3 项目版本
 
-- 当前主线：`v3.3.2`（2026-09）— 基础功能 + 工具调用 + 专家模式 + 联网搜索 + React WebUI 管理面板 + 上游限流提示解析 + 多轮会话复用（parent 链 + 增量 prompt）+ 上游并发上限 + stats 历史采样修复
+- 当前主线：`v3.3.8`（2026-10-18）— 跟进上游「快速模式 / 专家模式」合并：**收敛为单模型**（`/v1/models` 只列 `MODEL_NAME`，旧名 `deepseek-reasoner` 降为不改行为的别名，思考由 `THINKING` 决定），`model_type` 降级为协议字段，`MODEL_ROUTES` 降级为可选高级覆盖，新增统一决策函数 `resolve_model_controls()`，合并流式/非流式会话缓存键，并修复「客户端每轮只发最新消息」时的多轮失忆；完整变更见 [docs/release-notes/v3.3.8.md](docs/release-notes/v3.3.8.md)
+- `v3.3.6`（2026-10）— 在 v3.3.5 基础上新增 WebUI 客户端 API Key 管理，统一账号池配置，并改进 Windows 启动脚本和 WebUI 依赖构建失败处理；完整变更见 [docs/release-notes/v3.3.6.md](docs/release-notes/v3.3.6.md)
 - 自 v3.0.0 起开源版与预览版已合并为单一主线，无独立 `--pre` 分支
 
 ---
@@ -190,7 +231,9 @@ D:\the llaa\DS反代 --pre\
 
 | 文件 | 职责 | 不负责 |
 |------|------|--------|
-| `server.py` | HTTP 路由、请求/响应模型、OpenAI 格式组装、工具调用协调 | PoW 求解、原生 SSE 解析 |
+| `server.py` | HTTP 路由、请求/响应模型、OpenAI 格式组装、工具调用协调、**能力决策**（`resolve_model_controls()`：`MODEL_ROUTES`/`THINKING`/`SEARCH`/旧 `MODE` → `model_type`+thinking+search）、多轮会话缓存与 prompt 组装（`_cache_key()` / `SessionCache` / `prepare_prompt()`） | PoW 求解、原生 SSE 解析 |
+| `model_router.py` | `MODEL_ROUTES` 解析：model 名 → 能力预设（`model_type` 协议字段 + `thinking`/`search`）；字符串简写=思考开关，dict 形式可显式指定字段；`DEFAULT_MODEL_TYPE="default"`；`ModelRouter(models=[...])` 提供 `/v1/models` 回落名单 | 环境变量优先级决策（在 `server.py`）、HTTP 路由 |
+| `session_cache.py` | 多轮会话缓存：`conv:<sha256>` 键派生、TTL（默认 1800s）、`delta_prompt()` 前缀比对、`ChatSession.diverged_turns` 计数 | HTTP 路由、上游协议 |
 | `adapter.py` | 与 DeepSeek API 通信、PoW 求解、SSE 流解析、会话创建 | HTTP 路由、OpenAI/Anthropic 格式 |
 | `anthropic_format.py` | Anthropic `/v1/messages` 请求解析、响应组装、SSE 生成 | DeepSeek 协议、HTTP 路由 |
 | `account_pool.py` | 多账号 CRUD、状态追踪（idle/busy/error）、轮询分配、健康检查/重登录 | HTTP 路由、DeepSeek 协议 |
@@ -231,7 +274,7 @@ pip install -r requirements.txt
 
 # 3. 配置凭证（从浏览器 DevTools 获取）
 copy .env.example .env
-# 编辑 .env: 填入 DEEPSEEK_TOKEN 和 DEEPSEEK_COOKIES
+# 在 WebUI「账号池」添加账号，或写入 data/accounts.json；账号凭证不放入 .env
 
 # 4. 启动服务
 python server.py
@@ -419,14 +462,16 @@ add_to_stack(16)                       // 恢复栈指针
 
 ## 5. 会话管理
 
-### 5.1 设计决策：无状态
+### 5.1 设计决策：客户端持有上下文，服务端只做缓存
 
-**核心决策：** 每次 API 请求都创建全新 DeepSeek 会话，请求结束后不保留上下文。
+**核心决策：** 上下文以客户端重发的完整 `messages` 数组为准；服务端**不依赖**上游会话维持正确性——任何一轮都能仅凭完整 prompt 重建上下文。
+
+**服务端会话缓存（v3.2.0+；v3.3.8 起更保守）：** 当调用方给出**显式**会话标识（OpenAI `X-Conversation-Id` 头 / 顶层 `user`，Anthropic `metadata.user_id`）时，`SESSION_CACHE`（`SESSION_CACHE_TTL`，默认 1800s）复用同一上游会话与 `parent_message_id` 链，并只把**新增尾部**作为 prompt 发给上游（增量 prompt，见 §5.6）。没有显式标识时每轮新建上游会话，等价于纯无状态。
 
 **原因：**
 - 对齐 OpenAI API 行为：客户端通过完整 `messages` 数组管理上下文
-- 简化服务端状态管理：无需处理会话过期、并发冲突
-- DeepSeek 会话有 TTL（约 259200 秒/3 天），维持活跃会增加复杂度
+- 缓存只是优化（省 token、保住上游 thread）；一旦对不上就必须退化为「重发完整 prompt」，而不是丢掉上下文
+- DeepSeek 会话有 TTL（约 259200 秒/3 天），长期维持活跃会增加复杂度
 
 ### 5.2 Session 创建
 
@@ -471,7 +516,7 @@ _sessions: dict[str, str] = {}
 
 ### 5.4 消息 ID 追踪
 
-对于专家模式，每个会话内的消息需要递增 `parent_message_id`。
+复用一个上游会话时（`SESSION_CACHE` 命中），同一会话内的消息需要递增 `parent_message_id`。
 
 ```python
 # adapter.py
@@ -482,22 +527,38 @@ self._msg_counters: dict[str, int] = {}  # key: session_id, value: count
 - 首次请求: `parent_message_id: null`
 - 后续请求: `parent_message_id: 1, 2, 3...`
 
-**注意：** 当前 session-per-request 设计下，`parent_message_id` 始终为 `null`（因为每次都是新 session 的第一条消息）。但保留递增逻辑以支持未来的会话复用。如果将来改为复用 session，`parent_message_id` 将变为必需——DeepSeek 服务端用它来关联上下文。
+**注意：** 实际生效的 `parent_message_id` 由 `SESSION_CACHE` 维护（v3.2.3 起）：adapter 从 SSE `event: ready` 的 `response_message_id` 提取真实 message id，`record_message_id()` 写回缓存，下一轮再取出发给上游。只有新建上游会话（无缓存）或限流/空响应后换会话重试时才回落到 `null`；`_msg_counters` 的自增仍保留，供绕过 server 缓存的直接调用（调试脚本）使用。
 
 ### 5.5 Session 存储策略
 
-当前 `_sessions` 使用**简单的内存 dict**：
+`_sessions` 仍是**简单的内存 dict**（代理 session UUID → DeepSeek session ID）：
 
 ```python
 # server.py
 _sessions: dict[str, str] = {}
 ```
 
-每次请求创建一个新 session（`_get_session()`），键值对保留在字典中。历史上曾尝试添加 TTL 自动清理，但由于以下原因**选择不实现**：
-- session-per-request 设计下，单个请求生命周期极短，session 不会被复用
+多轮复用走的是另一套带 TTL 的 `SESSION_CACHE`（默认 1800s）；`_sessions` 本身不做清理，仍按以下理由**选择不实现**：
+- 没有显式会话标识时每轮都新建 session，单个请求生命周期极短，session 不会被复用
 - DeepSeek 服务端的 session TTL 约 3 天（259200s），旧 session ID 无实际危害
 - Python dict 的内存效率足以应付常规负载（100 万次请求约 150MB）
 - 增加清理逻辑增加了代码复杂度，且对正确性无帮助
+
+**缓存键（v3.3.8 现状）：** 多轮会话缓存键由 `_cache_key(request, conversation_id)` 生成，形如 `conv:<sha256>`，由「会话标识 + 调用方 scope（API key 的哈希；无鉴权时为客户端 IP）」派生。流式与非流式**共用同一命名空间**——v3.2.2 引入的 `stream:`/`nonstream:` 前缀已在 v3.3.8 移除（见文首 v3.3.8 小节），同一会话中途切换 `stream` 不再另起新上游会话。
+
+### 5.6 多轮 prompt 组装：增量与发散（v3.3.8）
+
+`AcquiredAccount.prepare_prompt()` 在 `create_session()` **之前**调用，用 `session_cache.delta_prompt(prev, cur)` 比对「上一轮实际发送的完整 prompt」与「本轮完整 prompt」，分三支：
+
+| 情况 | `delta_prompt()` 结果 | 行为 |
+|------|----------------------|------|
+| 完全重复（同一轮重试） | 等于 `cur`（无新增尾部） | 原样重发完整 prompt |
+| 历史一致延伸（客户端重发全部历史 + 新消息） | 新增尾部 | 只发新增尾部，上下文由服务端 parent 链维系 |
+| **历史发散**（客户端只发最新一条消息 / 编辑或截断历史） | `None` | **保留**会话与 `parent_message_id` 链，重发**完整** prompt |
+
+**根因（已修复）：** 发散支此前执行 `SESSION_CACHE.invalidate()` 并丢弃会话——每轮只发最新一条消息的客户端于是每轮都拿到全新的上游会话，模型表现为「失忆」（问「我叫什么名字」答不上来）。现在保留会话链、重发完整 prompt：代价是偶尔多发一次完整 prompt 的 token，换来上下文连续，已对实时上游验证。发散时累加 `ChatSession.diverged_turns` 并打 `session_prompt_diverged`（INFO，字段含 `session_id` / `account_id` / `diverged_turns` / `prompt_chars`），可用于观测某客户端是否长期处于发散态。
+
+> 注意：发散时**不**换会话，所以 `diverged_turns` 持续增长只说明该客户端的 messages 组装方式与上一轮不构成前缀关系（典型是每轮只发最新 user 消息），不是错误；`diverged_turns` 目前只进日志，未在 `/admin/api/*` 暴露。
 
 ---
 
@@ -524,8 +585,10 @@ B. 操作事件:      {"p": "response/content", "o": "APPEND", "v": "World"}
 C. 响应元数据:    {"v": {"response": {"message_id": 4, ...}}}
 D. 状态变更:      {"p": "response/status", "o": "SET", "v": "FINISHED"}
 E. 批量更新:      {"p": "response", "o": "BATCH", "v": [...]}
-F. 准备事件:      {"request_message_id": 1, "response_message_id": 2, "model_type": "expert"}
+F. 准备事件:      {"request_message_id": 1, "response_message_id": 2, "model_type": "default"}
 ```
+
+> 注：2026-10-18 起上游把 `model_type` 一律改写为 `"default"`（见 §7.6），本文档所有示例帧均按现状写作 `"default"`；历史抓包中的 `"expert"` 已不再出现。
 
 ### 6.2 事件类型详解
 
@@ -536,7 +599,7 @@ F. 准备事件:      {"request_message_id": 1, "response_message_id": 2, "model
 - 无 `p` 和 `o` 字段
 - `v` 值为字符串 → 追加到当前 fragment 的内容
 - 在快速模式中等效为普通回复内容
-- 在专家模式中，归属由当前 `frag_type` 状态决定
+- 开启思考（`thinking_enabled=true`）时，归属由当前 `frag_type` 状态决定（§7.8）
 
 #### type B: 操作路径事件
 ```json
@@ -550,8 +613,8 @@ F. 准备事件:      {"request_message_id": 1, "response_message_id": 2, "model
 
 | `p` | `o` | `v` 类型 | 含义 |
 |-----|-----|---------|------|
-| `response/content` | `APPEND` | string | 快速模式内容追加 |
-| `response/fragments/-1/content` | `APPEND` | string | 专家模式当前 fragment 内容追加 |
+| `response/content` | `APPEND` | string | 非 fragment 路径的内容追加（未开启思考时常见） |
+| `response/fragments/-1/content` | `APPEND` | string | 当前 fragment 内容追加（开启思考时常见） |
 | `response/fragments/-1/content` | — | string | 无操作字段时同上 |
 | `response/fragments/-1/elapsed_secs` | `SET` | number | fragment 耗时 |
 | `response/fragments` | `APPEND` | array | 新 fragment 追加（切换类型） |
@@ -571,11 +634,12 @@ F. 准备事件:      {"request_message_id": 1, "response_message_id": 2, "model
 #### type D: 准备事件（event: ready）
 ```
 event: ready
-data: {"request_message_id": 1, "response_message_id": 2, "model_type": "expert"}
+data: {"request_message_id": 1, "response_message_id": 2, "model_type": "default"}
 ```
 - 仅在 `event: ready` 行之后出现
 - 告知请求/响应的 message_id 映射关系
-- `model_type` 指示实际使用的模型类型（`"default"` 或 `"expert"`）
+- `model_type` **恒为 `"default"`**（2026-10-18 起上游一律改写，见 §7.6）
+- `response_message_id` 被 adapter 用于维护多轮 `parent_message_id`（§5.4）
 
 ### 6.3 快速模式 SSE 事件序列
 
@@ -600,13 +664,13 @@ event: close
 data: {"click_behavior":"none","auto_resume":false}
 ```
 
-### 6.4 专家模式 SSE 事件序列
+### 6.4 思考输出 SSE 事件序列（原「专家模式」）
 
-专家模式使用 **Fragment 系统**，响应内容由多个 fragment 组成（THINK → RESPONSE）。
+开启思考（`thinking_enabled=true`）时使用 **Fragment 系统**，响应内容由多个 fragment 组成（THINK → RESPONSE）；与 `model_type` 无关（上游恒回 `"default"`，见 §7.6）。
 
 ```
 event: ready
-data: {"request_message_id":1,"response_message_id":2,"model_type":"expert"}
+data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}
 
 event: update_session
 data: {"updated_at": ...}
@@ -657,12 +721,12 @@ SSE 流中的第一个事件，携带请求/响应的 message_id 映射：
 
 ```
 event: ready
-data: {"request_message_id": 1, "response_message_id": 2, "model_type": "expert"}
+data: {"request_message_id": 1, "response_message_id": 2, "model_type": "default"}
 ```
 
 - `request_message_id` — DeepSeek 服务端分配的请求 ID
 - `response_message_id` — DeepSeek 服务端分配的响应 ID（后续的 `{"v": {"response": {...}}}` 中的 `message_id` 与此一致）
-- `model_type` — 实际使用的模型类型（`"default"` 或 `"expert"`），与请求体中的 `model_type` 一致
+- `model_type` — **恒为 `"default"`**（上游把任何取值改写为 `"default"`，见 §7.6），与请求体里发什么无关
 
 #### `event: update_session`
 
@@ -739,79 +803,96 @@ DeepSeek 内部使用的状态字段，与 `response/status` 同步。值为 `"F
 
 ---
 
-## 7. MODE / THINKING / SEARCH 控制系统
+## 7. 模型能力控制（MODEL_ROUTES / THINKING / SEARCH）
+
+> v3.3.8 起本章语义已更新：`model_type` 不再是能力开关，而是**协议字段**（上游一律改写为 `"default"`）。需要推理能力时用 `MODEL_ROUTES` 预设或 `THINKING`/`MODE` 打开思考。
 
 ### 7.1 设计思路
 
-DeepSeek 的 API 有三个独立参数控制模型行为：
-- **`model_type`**: `"default"`（快速模式）或 `"expert"`（专家模式）
-- **`thinking_enabled`**: `true/false` — 是否输出推理过程
-- **`search_enabled`**: `true/false` — 是否启用联网搜索
+上游请求体里有三个相关参数，但 2026-10-18 实测后**只剩两个自由度**：
 
-**关键认知：这三个参数完全独立。**
+- **`model_type`**：**协议字段**。`GET /api/v0/client/settings?scope=model` 显示 `expert` 已 `enabled:false, switchable:false`，上游把请求体里的一切取值改写为 `"default"`（§7.6）。本项目恒发 `DEFAULT_MODEL_TYPE = "default"`；只有 `MODEL_ROUTES` 的 dict 形式显式写了别的值才另发（为上游将来放开 `vision` 之类留口子）。
+- **`thinking_enabled`**：`true/false` — 是否输出推理过程。**这是当前唯一的能力开关**（原「专家模式」的全部实际差异）。
+- **`search_enabled`**：`true/false` — 是否启用联网搜索。
 
-历史版本曾错误地将 `thinking_enabled=true` 等同于专家模式。实际 `model_type="default"`（快速模式）+ `thinking_enabled=true` 也是有效组合——快速模式可以同时开启思考。同样，`search_enabled` 与 `model_type`、`thinking_enabled` 完全独立。
+历史演进（保留结论，避免重蹈）：v2.x 曾把 `thinking_enabled=true` 等同于专家模式；后来发现 `model_type="default"` + `thinking_enabled=true` 也有效；2026-10-18 A/B 实测确认 `model_type=expert` 与 `default` 的输出逐字相同，于是本项目不再用 `model_type` 表达能力。
 
-项目通过三个 `.env` 环境变量暴露这三个自由度：
+能力通过**两个 `.env` 开关**决定（`THINKING` / `SEARCH`），另留一个已降级的旧开关与一个**可选**的路由覆盖：
 
-| 环境变量 | 控制参数 | 可选值 |
-|---------|---------|-------|
-| `MODE` | `model_type` | `auto` / `quick` / `expert` |
-| `THINKING` | `thinking_enabled` | `auto` / `enabled` / `disabled` |
+| 来源 | 控制 | 可选值 |
+|------|------|-------|
+| `THINKING`（**推荐，主开关**） | `thinking_enabled` | `auto` / `enabled` / `disabled` |
 | `SEARCH` | `search_enabled` | `auto` / `enabled` / `disabled` |
+| `MODE`（**已降级**，v3.3.8） | 仅 thinking（旧版兼容） | `auto`（不介入）/ `quick`（≡关闭思考）/ `expert`（≡开启思考） |
+| `MODEL_ROUTES`（**可选高级覆盖**，默认不配置） | 按 model 名给 thinking / search 预设（+ 可选 `model_type`） | 字符串简写：`"default"`/`"quick"`=关闭思考，`"thinking"`/`"expert"`/`"reasoner"`=开启思考；dict 形式：`{"thinking":true,"search":true,"model_type":"default"}` |
 
-`auto` 表示"由客户端 request 中的对应字段决定"，非 `auto` 值会覆盖客户端传参。
+> **不配置 `MODEL_ROUTES` 时不存在「按模型名分流」这回事**：`/v1/models` 只列 `MODEL_NAME`，是否思考完全看 `THINKING`（或请求里的 `thinking_mode`）。旧名 `deepseek-reasoner` 等是**别名**（`LEGACY_MODEL_ALIASES`），照常被接受但不改变行为。
+
+`auto` 表示"由下一优先级（客户端 request 字段）决定"，非 `auto` 值覆盖客户端传参。
 
 ### 7.2 实现方式（`server.py`）
 
+决策集中在 `resolve_model_controls(decision, req_thinking, req_search) -> (model_type, thinking, search)`——OpenAI 与 Anthropic 两条路径共用它（v3.3.8 之前是两处重复的 `if MODE == "expert"` 代码块）：
+
 ```python
 # server.py 模块级
-MODE = os.environ.get("MODE", "auto").strip().lower()
+MODE = os.environ.get("MODE", "auto").strip().lower()   # 已降级，只影响 thinking，见 7.1
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
 SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
 
-# chat_completions() 中
-if MODE == "expert":
-    model_type = "expert"
-else:  # "quick" 或 "auto"
-    model_type = "default"
+# 能力决策（唯一入口）
+def resolve_model_controls(decision, req_thinking=False, req_search=False):
+    model_type = decision.model_type or DEFAULT_MODEL_TYPE   # 恒 "default"，除非 MODEL_ROUTES dict 显式指定
 
-if THINKING == "enabled":
-    thinking = True
-elif THINKING == "disabled":
-    thinking = False
-else:  # "auto"
-    thinking = req.thinking_mode or False
+    if decision.thinking is not None:        # 1. MODEL_ROUTES 预设
+        thinking = decision.thinking
+    elif THINKING == "enabled":              # 2. THINKING env
+        thinking = True
+    elif THINKING == "disabled":
+        thinking = False
+    else:
+        legacy = _legacy_mode_thinking()      # 3. 旧 MODE：expert→True, quick→False, auto→None
+        thinking = legacy if legacy is not None else bool(req_thinking)
 
-if SEARCH == "enabled":
-    search = True
-elif SEARCH == "disabled":
-    search = False
-else:  # "auto"
-    search = req.search_enabled or False
+    if decision.search is not None:          # search 同构：预设 → SEARCH env → 客户端字段
+        search = decision.search
+    elif SEARCH == "enabled":
+        search = True
+    elif SEARCH == "disabled":
+        search = False
+    else:
+        search = bool(req_search)
+
+    return model_type, thinking, search
 ```
 
-注意 `model_type` 在非 `MODE=expert` 时设为 `"default"`（非 `None`）。这与 DeepSeek 原生请求格式一致。
+注意 `model_type` 恒为 `"default"`（非 `None`）。这与 DeepSeek 原生请求格式一致；即便发了别的值，上游也会改写回 `default`。
 
-### 7.3 八种组合及 OpenAI SSE 行为
+### 7.3 能力组合与决策优先级
 
-| MODE | THINKING | SEARCH | model_type | thinking_enabled | search_enabled | 实际效果 |
-|------|----------|--------|------------|-----------------|---------------|---------|
-| quick | disabled | auto | `"default"` | `false` | 由客户端 | 快速模式，无思考 |
-| quick | enabled | disabled | `"default"` | `true` | `false` | 快速模式 + 思考，关闭搜索 |
-| quick | enabled | enabled | `"default"` | `true` | `true` | 快速 + 思考 + 搜索 |
-| expert | disabled | auto | `"expert"` | `false` | 由客户端 | 专家模式，无思考 |
-| expert | enabled | auto | `"expert"` | `true` | 由客户端 | 完整专家模式 |
-| expert | enabled | enabled | `"expert"` | `true` | `true` | 专家 + 思考 + 搜索 |
-| auto | auto | auto | `"default"` | `req.thinking_mode` | `req.search_enabled` | 完全由客户端决定 |
-| quick | auto | enabled | `"default"` | `req.thinking_mode` | `true` | 快速模式 + 强制搜索 |
+| MODEL_ROUTES | THINKING | SEARCH | model_type（上游收到的） | thinking_enabled | search_enabled | 实际效果 |
+|--------------|----------|--------|------------------------|-----------------|---------------|---------|
+| 未配置（默认） | auto | auto | `"default"` | `req.thinking_mode` | `req.search_enabled` | 单模型；由客户端/`THINKING` 决定 |
+| 未配置（默认） | enabled | auto | `"default"` | `true` | 由客户端 | 单模型 + 强制思考（**取代旧的「专家模式模型」**） |
+| 未配置（默认） | disabled | auto | `"default"` | `false` | 由客户端 | 单模型 + 直接回答 |
+| 命中 `"default"` 预设 | auto | auto | `"default"` | `false` | 由客户端 | 该名字 = 直接回答 |
+| 命中 `"thinking"` 预设 | auto | auto | `"default"` | `true` | 由客户端 | 该名字 = 启用思考 |
+| 未命中 | enabled | disabled | `"default"` | `true` | `false` | 强制思考、关闭搜索 |
+| 未命中 | enabled | enabled | `"default"` | `true` | `true` | 思考 + 搜索 |
+| 未命中 | auto | auto | `"default"` | `req.thinking_mode` | `req.search_enabled` | 完全由客户端决定 |
+| 未命中 | auto | auto + 旧 `MODE=expert` | `"default"` | `true` | 由客户端 | 兼容旧配置：只影响 thinking |
+| 未命中 | auto | auto + 旧 `MODE=quick` | `"default"` | `false` | 由客户端 | 兼容旧配置：只影响 thinking |
 
-所有组合均已通过原始 SSE 抓包验证。
+**决策优先级（`resolve_model_controls()`，最高 → 最低）：**
 
-**MODE=auto 时的回退行为：**
-- MODE=auto → model_type="default"（快速模式）
-- THINKING=auto → thinking = req.thinking_mode or False
-- SEARCH=auto → search = req.search_enabled or False
+```
+MODEL_ROUTES 命中（thinking/search 预设，dict 可带 model_type）
+  → THINKING / SEARCH env（enabled/disabled）
+  → 客户端字段（thinking_mode / search_enabled）
+  → 旧 MODE（仅 thinking：expert≡on、quick≡off、auto 不介入）
+```
+
+**`model_type` 不参与优先级**：无论哪个组合，请求体里都是 `"model_type":"default"`，差异只体现在 `thinking_enabled` / `search_enabled` 上。
 
 ### 7.4 SEARCH 环境变量详解
 
@@ -826,11 +907,11 @@ else:  # "auto"
 **注意：**
 - `search_enabled` 只是告知模型"可以联网搜索"，模型自主决定是否需要搜索
 - 搜索结果以 `[citation:N]` 引用标记形式出现在回复中，这些标记会被 `_clean_dsml_text()` 自动去除
-- 该参数与 `model_type`、`thinking_enabled` 完全独立，所有 2×2×2=8 种组合均有效
+- 该参数与 `thinking_enabled` 相互独立（`model_type` 已退化为协议字段，恒 `"default"`），thinking × search 的 4 种组合均有效
 
-### 7.5 "快速模式 + 思考" 的 SSE 格式
+### 7.5 开启思考时的 SSE 格式（Fragment 系统）
 
-快速模式也使用 Fragment 系统（无需 `model_type: "expert"`），所以 SSE 格式与专家模式无异：
+开启思考后（`thinking_enabled=true`）响应走 Fragment 系统，与 `model_type` 无关（上游恒为 `"default"`）：
 
 ```
 // 初始响应带 fragments[0] = THINK
@@ -850,19 +931,21 @@ data: {"v":"最终"}
 data: {"p":"response/status","o":"SET","v":"FINISHED"}
 ```
 
-### 7.6 Expert Mode（专家模式）核心区别
+### 7.6 模式合并现状（原「专家模式」）
 
-当 `model_type="expert"` 时，除 MODE 控制外，还有以下额外差异：
+2026-10-18 实测：上游已把「快速模式 / 专家模式」合并为同一能力，`model_type` 不再是有效开关。
 
-| 维度 | 快速模式 | 专家模式 |
-|------|---------|---------|
-| `model_type` | `"default"` | `"expert"` |
-| SSE 内容格式 | 同上（均可能用 fragments） | 同上（均可能用 fragments） |
-| Fragment 系统 | 可选（模型自主决定） | 一定有 THINK → RESPONSE |
-| `reasoning_content` | 取决于 THINKING | 取决于 THINKING |
-| 请求头要求 | 宽松 | 需 `X-Client-Version: 2.3.0` 等（见 7.7） |
+| 维度 | 2026-10-18 现状 |
+|------|----------------|
+| 上游模式列表 | `default`（快速模式，`enabled:true, switchable:true`）；`expert`（专家模式，`enabled:false, switchable:false`）；`vision`（识图模式，`enabled:false, switchable:false`） |
+| 请求体 `model_type` | 客户端发什么都会被上游改写为 `"default"`；`event: ready` 帧恒回 `{"model_type":"default"}` |
+| 输出正文 | 同一 prompt 下 `default` 与 `expert` 逐字相同（各 3 次，24/24/24 字） |
+| 耗时 | 中位数 4.01s vs 4.65s——噪声范围内，不构成差异 |
+| 工具调用 | DSML 在两者下都成功解析出同样的 `get_weather` 调用 |
+| 浏览器自身 | HAR 中 7 个 completion 请求体全部是 `"model_type":"default"` |
+| 能力差异 | 只剩 `thinking_enabled`（是否输出推理）与 `search_enabled`（是否联网） |
 
-实际上 DeepSeek 的快速模式和专家模式在 SSE 协议层差异极小，`model_type` 主要影响模型的选择与其推理深度。
+因此本项目把 `model_type` 当协议字段发；需要推理能力时用 `MODEL_ROUTES`/`THINKING` 打开思考（§7.1）。若上游将来重新放开 `expert`/`vision`，`MODEL_ROUTES` 的 dict 形式可以直接写 `{"model_type":"vision"}` 而无需改代码。
 
 ### 7.7 请求头要求（2026-08 现状）
 
@@ -905,7 +988,7 @@ frag_type = None  # 状态: None | 'thinking' | 'content'
   └─ 收到响应中 fragments 为空或无 THINK → frag_type = "content"
 ```
 
-状态机在两种模式下都运行——无论是 `model_type="default"`（快速模式）还是 `model_type="expert"`（专家模式），DeepSeek 都可能返回 THINK fragment。区别在于专家模式下 THINK fragment 几乎一定会出现，而快速模式下由模型自主决定。
+状态机与 `model_type` 无关（上游恒回 `"default"`，§7.6）：是否出现 THINK fragment 取决于 `thinking_enabled`——开启思考时几乎一定出现 THINK → RESPONSE；关闭思考时由模型自主决定，也可能完全没有 fragment。
 
 ### 7.9 SSE `reasoning_content` 字段
 
@@ -996,27 +1079,28 @@ yield "data: [DONE]\n\n"
 }
 ```
 
-| 字段 | 类型 | 快速模式 | 专家模式 | 说明 |
+| 字段 | 类型 | 直接回答（thinking off） | 开启思考（thinking on） | 说明 |
 |------|------|---------|---------|------|
 | `chat_session_id` | string | 必填 | 必填 | `create_session()` 返回的会话 ID |
-| `parent_message_id` | int/null | null | null | 上一条消息的 ID，首条为 null |
-| `model_type` | string | `"default"` | `"expert"` | **关键开关**，由 MODE 环境变量决定 |
-| `prompt` | string | 必填 | 必填 | 拼接后的纯文本 prompt |
+| `parent_message_id` | int/null | null/上一条 id | null/上一条 id | 上一条消息的 ID，首条为 null；多轮由 `SESSION_CACHE` 回传（§5.4） |
+| `model_type` | string | `"default"` | `"default"` | **协议字段**：上游一律改写为 `"default"`，不再表达能力（§7.6） |
+| `prompt` | string | 必填 | 必填 | 拼接后的纯文本 prompt（可能是增量尾部，§5.6） |
 | `ref_file_ids` | list | `[]` | `[]` | 文件引用 ID，始终为空（不支持文件上传） |
 | `stream` | bool | 按需 | 按需 | 服务端 SSE 流式开关 |
-| `thinking_enabled` | bool | 由 THINKING 决定 | 由 THINKING 决定 | 启用推理过程输出 |
-| `search_enabled` | bool | 由 SEARCH 决定 | 由 SEARCH 决定 | 启用联网搜索 |
+| `thinking_enabled` | bool | 由 `MODEL_ROUTES`/THINKING 决定 | 由 `MODEL_ROUTES`/THINKING 决定 | 启用推理过程输出 |
+| `search_enabled` | bool | 由 SEARCH/客户端决定 | 由 SEARCH/客户端决定 | 启用联网搜索 |
 | `preempt` | bool | false | false | 抢占模式，始终为 false |
 
-**`model_type`、`thinking_enabled`、`search_enabled` 的协作：**
+**`model_type`、`thinking_enabled`、`search_enabled` 的协作（v3.3.8 现状）：**
 
-| 场景 | model_type | thinking_enabled | search_enabled | 说明 |
-|------|-----------|-----------------|---------------|------|
-| 纯快速模式 | `"default"` | `false` | `false` | 基础模式 |
-| 快速+思考 | `"default"` | `true` | `false` | 快速响应但附带推理过程 |
-| 快速+搜索 | `"default"` | `false` | `true` | 快速响应 + 联网搜索 |
-| 专家无思考 | `"expert"` | `false` | `false` | 专家模型但不输出推理（罕见） |
-| 完整专家 | `"expert"` | `true` | `true` | 专家模型 + 完整推理 + 联网搜索 |
+| 场景 | model_type（上游收到的） | thinking_enabled | search_enabled | 说明 |
+|------|------------------------|-----------------|---------------|------|
+| 直接回答 | `"default"` | `false` | `false` | `deepseek-chat` 预设 / `THINKING=disabled` |
+| 思考 | `"default"` | `true` | `false` | `deepseek-reasoner` 预设 / `THINKING=enabled`（原「专家模式」） |
+| 思考 + 搜索 | `"default"` | `true` | `true` | 两个维度独立叠加 |
+| 直接回答 + 搜索 | `"default"` | `false` | `true` | 同上 |
+
+`model_type` 列已无能力含义；上游对 `"expert"` 等取值一律改写为 `"default"`（2026-10-18 实测，§7.6）。
 
 #### `preempt` 字段
 
@@ -1060,12 +1144,12 @@ DeepSeek Chat 网页版支持上传文件（如图片、PDF），上传后文件
 | 字段 | 值来源 | 说明 |
 |------|--------|------|
 | `chat_session_id` | `create_session()` 返回 | 会话 UUID |
-| `parent_message_id` | adapter `_msg_counters` 或 server 会话缓存 | 首条 `null`；多轮由 server 层 `SESSION_CACHE_TTL` 缓存回传 |
-| `model_type` | server 决策（MODEL_ROUTES/MODE） | `"default"`（快速）\| `"expert"`（专家），**关键开关** |
-| `prompt` | server `_build_prompt()` | 客户端 messages 拼接后的纯文本 |
+| `parent_message_id` | server 会话缓存（`SESSION_CACHE`）优先，adapter `_msg_counters` 兜底 | 首条 `null`；多轮由 `record_message_id()` 从 `event: ready` 写回 |
+| `model_type` | 固定 `DEFAULT_MODEL_TYPE`（`"default"`），除非 `MODEL_ROUTES` 的 dict 形式显式指定 | **协议字段**：上游一律改写为 `"default"`，不再表达能力（§7.6） |
+| `prompt` | server `_build_prompt()`（经 `prepare_prompt()` 增量/整段裁决） | 客户端 messages 拼接后的纯文本，可能是新增尾部（§5.6） |
 | `ref_file_ids` | 固定 `[]` | 不支持文件上传 |
 | `stream` | server 层 `req.stream` | `true`=SSE 流式 / `false`=一次性返回 |
-| `thinking_enabled` | server 决策（THINKING/客户端） | 推理过程开关，**与 `model_type` 独立** |
+| `thinking_enabled` | `resolve_model_controls()`（MODEL_ROUTES/THINKING/客户端/旧 MODE） | **当前唯一的能力开关** |
 | `search_enabled` | server 决策（SEARCH/客户端） | 联网搜索开关 |
 | `preempt` | 固定 `false` | 抢占模式；勿设 `true`（未定义行为） |
 
@@ -1076,11 +1160,11 @@ DeepSeek Chat 网页版支持上传文件（如图片、PDF），上传后文件
 | `User-Agent` / `Sec-Ch-Ua` / `Sec-Ch-Ua-Mobile` / `Sec-Ch-Ua-Platform` | Chrome 指纹（`DEEPSEEK_IMPERSONATE` 关联 curl_cffi 指纹） |
 | `Accept` / `Accept-Encoding` / `Accept-Language` | 浏览器风格（`gzip, deflate, br, zstd` / `zh-CN,...`） |
 | `Content-Type` | `application/json` |
-| `Authorization` | `Bearer <DEEPSEEK_TOKEN>`（账号凭证） |
+| `Authorization` | `Bearer <DeepSeek token>`（账号凭证） |
 | `Origin` / `Referer` | `https://chat.deepseek.com/` |
 | `Priority` | `u=1, i` |
 | `Sec-Fetch-Dest` / `Sec-Fetch-Mode` / `Sec-Fetch-Site` | `empty` / `cors` / `same-origin` |
-| `X-App-Version` / `X-Client-Version` | `2.0.0`（过低会被上游拒绝专家模式） |
+| `X-Client-Version` | `2.3.0`（`X-App-Version` 自 v3.2.0 起已删除，见 7.7） |
 | `X-Client-Platform` / `X-Client-Locale` / `X-Client-Timezone-Offset` | `web` / `zh_CN` / `28800` |
 | `x-client-bundle-id` | `com.deepseek.chat` |
 | `X-DS-PoW-Response` | **动态**：每次请求前求解，`base64(json PoW token)` |
@@ -1091,8 +1175,8 @@ DeepSeek Chat 网页版支持上传文件（如图片、PDF），上传后文件
 
 | 客户端字段 | server 决策（优先级从高到低） | 上游字段 |
 |-----------|------------------------------|---------|
-| `model` | `MODEL_ROUTES` 命中 → 对应 model_type；否则 `MODE=expert` → `"expert"`；否则 `"default"` | `model_type` |
-| `thinking_mode` | `MODEL_ROUTES.thinking` → `THINKING=enabled/disabled` → 客户端 `thinking_mode` | `thinking_enabled` |
+| `model` | `MODEL_ROUTES` 命中 → 该预设的 thinking/search（dict 形式可另带 `model_type`）；未命中 → 走 env/客户端链路 | `model_type`（恒 `"default"`）+ `thinking_enabled` + `search_enabled` |
+| `thinking_mode` | `MODEL_ROUTES.thinking` → `THINKING=enabled/disabled` → 旧 `MODE`（expert/quick）→ 客户端 `thinking_mode` | `thinking_enabled` |
 | `search_enabled` | `MODEL_ROUTES.search` → `SEARCH=enabled/disabled` → 客户端 `search_enabled` | `search_enabled` |
 | `stream` | 直接 | `stream` |
 | `temperature` / `top_p` / `max_tokens` | **读取后丢弃**，不参与透传 | — |
@@ -1102,19 +1186,22 @@ DeepSeek Chat 网页版支持上传文件（如图片、PDF），上传后文件
 
 | 客户端字段 | server 决策 | 上游字段 |
 |-----------|------------|---------|
-| `model` | 同 OpenAI | `model_type` |
-| `thinking.type="enabled"` | 映射为 `thinking_mode` 再走同上链路 | `thinking_enabled` |
+| `model` | 与 OpenAI 共用同一个 `resolve_model_controls()` | `model_type`（恒 `"default"`）+ `thinking_enabled` |
+| `thinking.type="enabled"` | 映射为 `req_thinking`，再走同一优先级链路 | `thinking_enabled` |
 | `metadata.user_id` | 会话缓存键（`SESSION_CACHE_TTL`） | `parent_message_id`（多轮） |
 | `system` / `messages` | `_build_prompt()` 拼接 | `prompt` |
 | `max_tokens` / `stop_sequences` / `temperature` | **忽略** | — |
 
-#### 环境变量优先级总结（最高 → 最低）
+#### 决策优先级总结（`resolve_model_controls()`，最高 → 最低）
 
 ```
-MODEL_ROUTES 命中（按 model 名）→ MODE / THINKING / SEARCH env → 客户端字段（thinking_mode / search_enabled）
+MODEL_ROUTES 命中（按 model 名，含 thinking/search 预设）
+  → THINKING / SEARCH env（enabled/disabled）
+  → 客户端字段（thinking_mode / search_enabled）
+  → 旧 MODE（仅 thinking：expert≡on、quick≡off、auto 不介入）
 ```
 
-`MODE`/`THINKING`/`SEARCH` 均为 `auto` 时，`model_type` 恒为 `"default"`、thinking/search 由客户端决定；`MODEL_ROUTES` 只影响匹配到的模型名，未匹配模型回退到 env 逻辑（见 7.12 协作表）。
+`model_type` **不在**这条优先级里：它恒为 `"default"`（`DEFAULT_MODEL_TYPE`），只有 `MODEL_ROUTES` 的 dict 形式显式写 `"model_type"` 时才会是别的值（上游仍会改写回 `default`）。`MODE` 已降级为旧配置兼容，见第 14 章。
 
 ---
 
@@ -1429,21 +1516,23 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None             # 当前被忽略
     tools: Optional[list[ToolDef]] = None     # 工具定义
     tool_choice: Optional[Union[str, dict]] = None  # 工具选择（不可靠）
-    thinking_mode: Optional[bool] = False     # 客户端请求的思考模式（被 MODE/THINKING env 覆盖）
+    thinking_mode: Optional[bool] = False     # 客户端请求的思考模式（被 MODEL_ROUTES/THINKING env 覆盖）
     search_enabled: Optional[bool] = False    # 联网搜索
 ```
 
-**`thinking_mode` 与 MODE/THINKING env 的关系：**
+**`thinking_mode` 与 MODEL_ROUTES / THINKING / MODE 的关系（v3.3.8）：**
 
 ```
-thinking_mode 只在 MODE=auto 且 THINKING=auto 时生效
-  ↑
-客户端请求       → MODE=auto, THINKING=auto → thinking = req.thinking_mode
-               → MODE=expert               → model_type = "expert"（忽略客户端）
-               → THINKING=enabled          → thinking = True（忽略客户端）
+优先级（高→低）：MODEL_ROUTES 预设 → THINKING env → 客户端 thinking_mode → 旧 MODE
+  → 配置了 MODEL_ROUTES 且命中某预设           → thinking = 该预设（忽略客户端）
+  → THINKING=enabled                          → thinking = True（忽略客户端）
+  → 都未命中 / auto                            → thinking = req.thinking_mode
+  → 旧 MODE=expert / quick                     → thinking = True / False（仅当以上都未命中）
 ```
 
-即：环境变量的优先级高于客户端传参。
+> 未配置 `MODEL_ROUTES`（默认）时第一行不存在，于是「思考与否」= `THINKING` 或客户端字段；旧名 `deepseek-reasoner` 不再触发任何预设（它只是别名）。
+
+即：环境变量（与路由预设）的优先级高于客户端传参。`model_type` 已不在这条链路里——上游恒收到 `"default"`（§7.6）。
 
 ### 10.3 流式 SSE 格式
 
@@ -1527,6 +1616,8 @@ data: [DONE]
 ### 10.6 模型名称处理
 
 `MODEL_NAME` 通过 `.env` 配置，默认 `"deepseek-chat"`。可自定义为 `"gpt-4"`、`"deepseek-reasoner"` 等任意值，**不影响实际转发**，仅用于响应中的 model 字段。
+
+**单模型（v3.3.8）**：`DEFAULT_MODEL_NAMES = [MODEL_NAME]`，所以 `/v1/models` **只返回一个** id。旧名（`deepseek-reasoner` / `deepseek-r1` / `deepseek-thinking` / `deepseek-expert` / `deepseek-chat-thinking` / `deepseek-chat-direct`）由 `model_router.LEGACY_MODEL_ALIASES` + `canonical_model_name()` 归一到 `MODEL_NAME`，因此老客户端请求它们仍能拿到回答——但**只是别名**：既不改变 `thinking_enabled`，也不出现在 `/v1/models` 里。要思考请设 `THINKING=enabled`（或请求传 `thinking_mode:true`）。配置了 `MODEL_ROUTES` 时 `/v1/models` 改为列出其键（可选高级覆盖）。
 
 ---
 
@@ -1658,21 +1749,23 @@ Anthropic 使用 `tool_use`/`tool_result` content block 类型，与 OpenAI 的 
 | `_dsml_toolcalls_to_anthropic()` | OpenAI tool_calls → Anthropic tool_use blocks |
 | `_emit_tool_use_blocks()` | tool_use → SSE content_block_start/delta/stop 事件 |
 
-### 11.8 MODE/THINKING/SEARCH 交互
+### 11.8 能力决策交互（MODEL_ROUTES / THINKING / SEARCH）
 
-与 OpenAI 端点共享 MODE/THINKING/SEARCH 环境变量：
+与 OpenAI 端点**共用同一个** `resolve_model_controls()`（v3.3.8 之前是两处重复实现），因此优先级完全一致：
 
 ```
+MODEL_ROUTES 命中 → THINKING/SEARCH env → 请求里的 thinking.type → 旧 MODE
 THINKING=enabled  → 强制 thinking=true（无视请求中 thinking 参数）
 THINKING=disabled → 强制 thinking=false
 THINKING=auto     → thinking = (请求中 thinking.type == "enabled")
+model_type        → 恒 "default"（协议字段，§7.6）
 ```
 
 ---
 
 ## 12. 多轮对话与消息组装
 
-### 11.1 `_build_prompt()`
+### 12.1 `_build_prompt()`
 
 将 OpenAI messages 数组转为 DeepSeek 纯文本格式：
 
@@ -1684,7 +1777,7 @@ Tool result: {"temperature": 25}
 User: 那湿度呢？
 ```
 
-### 11.2 角色映射
+### 12.2 角色映射
 
 | OpenAI role | Prompt 前缀 | 处理逻辑 |
 |-------------|------------|---------|
@@ -1693,15 +1786,27 @@ User: 那湿度呢？
 | `assistant` | `Assistant: ` | 文本 + tool_calls（转 DSML） |
 | `tool` | `Tool result: ` | 截断前 1000 字符 |
 
-### 11.3 system message 的工具注入
+### 12.3 system message 的工具注入
 
 当请求包含 `tools` 时，`build_dsml_tool_prompt()` 生成的指令会 **注入到 system message 末尾**。如果有多个 system message，指令会被拼接到第一个 system message 中。如果没有 system message，会创建一个新的 system 前缀。
+
+### 12.4 多轮组装：客户端持有历史 + 服务端增量/发散（v3.3.8）
+
+`_build_prompt()` 的输入始终是客户端**本轮发来的完整 messages**；拼好的完整 prompt 再交给 `AcquiredAccount.prepare_prompt()` 与上一轮比对（`session_cache.delta_prompt()`），决定实际发给上游的文本（§5.6）：
+
+| 客户端行为 | 实际发给上游 | 上下文来源 |
+|-----------|-------------|-----------|
+| 每轮重发全部历史 + 新消息 | 只有**新增尾部** | 上游 parent 链（`SESSION_CACHE` 维护） |
+| 每轮只发最新一条 user 消息 | **完整** prompt（发散） | 上游 parent 链 + 本轮完整文本（不再失效缓存） |
+| 同一轮重试（messages 完全相同） | 完整 prompt | 上游 parent 链 |
+
+**为什么服务端仍以「客户端完整 messages」为准**：这是唯一能保证正确性的来源——缓存命中与否只影响发多少 token，不影响回答的语义（§5.1）。v3.3.2～v3.3.6 在发散分支会 `invalidate()` 换新会话，导致「每轮只发最新消息」的客户端每轮都失忆；v3.3.8 改为保留会话链、重发完整 prompt。
 
 ---
 
 ## 13. ContentPart 支持
 
-### 12.1 解决的问题
+### 13.1 解决的问题
 
 OpenAI 的 `content` 字段支持两种格式：
 
@@ -1737,15 +1842,14 @@ class ContentPart(BaseModel):
 
 ## 14. 配置系统
 
-### 13.1 环境变量
+### 14.1 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DEEPSEEK_TOKEN` | — | Authorization Bearer Token |
-| `DEEPSEEK_COOKIES` | — | Cookie 字符串 |
-| `MODEL_NAME` | `deepseek-chat` | 响应中的模型名（不影响实际转发） |
+| `MODEL_NAME` | `deepseek-chat` | 本代理服务的**唯一**模型名：`/v1/models` 与 API 响应都用它；不影响上游转发（上游只有一个模型） |
 | `PORT` | `8080` | 服务器监听端口 |
-| `MODE` | `auto` | 模式控制：`auto`/`quick`/`expert` |
+| `MODEL_ROUTES` | `""` | JSON 路由表：model 名 → 能力预设（`"default"`/`"thinking"` 或 dict） |
+| `MODE` | `auto` | **已降级**（v3.3.8）：`quick`≡关闭思考、`expert`≡开启思考，不再改 `model_type`；仅当 `MODEL_ROUTES`/`THINKING`/客户端都没给出结论时生效 |
 | `THINKING` | `auto` | 思考控制：`auto`/`enabled`/`disabled` |
 | `SEARCH` | `auto` | 联网搜索控制：`auto`/`enabled`/`disabled` |
 | `DEEPSEEK_JITTER_SECS` | `0.4`（v3.2.2+） | 上游调用前随机 sleep（0~N 秒），降低触发上游限流概率；`0` 禁用 |
@@ -1756,24 +1860,19 @@ class ContentPart(BaseModel):
 
 | 变量 | 默认值 | 用途 | 非交互关键度 |
 |------|--------|------|------|
-| `API_KEYS` | `""` | `/v1/*` 客户端鉴权，逗号分隔多 key | ⭐必配(公网) |
-| `DEEPSEEK_API_KEY` | `""` | 单 key 别名，与 `API_KEYS` 等价 | 可选 |
+| 客户端 API Key | — | WebUI「设置」页创建和撤销；哈希存入 `data/api_keys.sqlite3` | ⭐必配(公网) |
 | `ALLOW_UNAUTHENTICATED_API` | `false` | 是否允许 /v1/* 无鉴权 | 仅本地开发 |
 | `HOST` | `127.0.0.1` | 监听地址；`0.0.0.0`+默认密码拒绝启动 | ⭐反代需关注 |
 | `PORT` | `8080` | 监听端口 | |
 | `MODEL_NAME` | `deepseek-chat` | /v1/models 显示名（不影响实际模型） | |
-| `MODEL_ROUTES` | `""` | JSON 路由表，按 model 字段切 quick/expert | ⭐多模型路由 |
-| `MODE` / `THINKING` / `SEARCH` | `auto` | 行为三独立维度 | ⭐强制模式 |
+| `MODEL_ROUTES` | `""` | JSON 路由表，model 名 → 能力预设（`default`/`thinking` 简写或 dict） | ⭐多模型路由 |
+| `MODE` / `THINKING` / `SEARCH` | `auto` | thinking/search 两个独立维度；`MODE` 已降级为旧配置兼容（不再改 `model_type`） | ⭐强制模式 |
 | `ACCOUNT_STORE_PATH` | `data/accounts.json` | 账号池持久化文件路径 | ⭐非交互账号池 |
 | `DEEPSEEK_ENCRYPTION_KEY` | `""` | Fernet key，accounts.json 加密(v2) | ⭐公网安全 |
 | `CLIENT_RPM_PER_KEY` | `60` | 每 key 每分钟请求数(0=不限) | ⭐限流 |
 | `CLIENT_RPM_PER_IP` | `120` | 每 IP 每分钟请求数(0=不限) | ⭐限流 |
 | `ENABLE_RATE_LIMIT` | `true` | 限流总开关 | |
 | `SESSION_CACHE_TTL` | `1800` | 多轮会话缓存秒数，0=禁多轮 | ⭐多轮 |
-| `DEEPSEEK_TOKEN` / `_N` | `""` | DeepSeek 账号凭证(token)，`_1`为多账号 | ⭐兜底账号 |
-| `DEEPSEEK_COOKIES` / `_N` | `""` | DeepSeek 账号 Cookie | ⭐兜底账号 |
-| `DEEPSEEK_EMAIL_N` | `env-N` | 多账号标识 | |
-| `DEEPSEEK_PROXY` / `_N` | `""` | 每账号上游代理 URL | ⭐反检测 |
 | `DEEPSEEK_IMPERSONATE` | `chrome131` | curl_cffi TLS 指纹 profile | |
 | `DEEPSEEK_JITTER_SECS` | `0.4` | 调用前随机 sleep 秒数 | |
 | `DEEPSEEK_RATE_LIMIT_RETRY_DELAYS` | `5,15` | 上游限流退避秒数列，空=禁重试 | |
@@ -1786,26 +1885,28 @@ class ContentPart(BaseModel):
 | `DISABLE_AUTO_RECOVER` | `false` | 禁用账号自动恢复 | |
 
 **给自动化/代理工具的配置 checklist（按顺序）：**
-1. `API_KEYS` 必配（否则 /v1/* 报 503）→ Bearer/x-api-key 鉴权
-2. 账号池：多账号→写 `data/accounts.json`；单兜底→`.env` 的 `DEEPSEEK_TOKEN_1/COOKIES_1`
+1. 在 WebUI「设置」页创建客户端 API Key（否则 `/v1/*` 报 503）→ Bearer/x-api-key 鉴权；旧版 `API_KEYS` / `DEEPSEEK_API_KEY` 仅首次初始化时导入
+2. 账号池：通过 WebUI 添加账号，或写入 `data/accounts.json`；`.env` 不配置账号凭证
 3. 公网→`HOST=127.0.0.1`+反代+`TRUSTED_PROXIES`；或 `HOST=0.0.0.0`+自己上 TLS/WAF
 4. 限流默认够用；多 worker(gunicorn -w N) 实际限流=N×配置值
 5. 改 `.env` 必须**重启进程**才生效（load_dotenv 只在模块加载时调用一次）
 
 
-#### MODE 详细说明
+#### MODE 详细说明（**已降级**，仅旧配置兼容）
 
-| 值 | 效果 | model_type |
-|----|------|-----------|
-| `auto` | 不强制，使用客户端默认行为 | `"default"`（快速模式） |
-| `quick` | 强制快速模式 | `"default"` |
-| `expert` | 强制专家模式 | `"expert"` |
+| 值 | 效果 | 对上游字段的影响 |
+|----|------|----------------|
+| `auto` | 不介入，交给 `MODEL_ROUTES`/`THINKING`/客户端字段 | 无 |
+| `quick` | 等价于 `thinking=false`（仅当上面几级都没给出结论时） | `thinking_enabled=false` |
+| `expert` | 等价于 `thinking=true`（同上） | `thinking_enabled=true` |
+
+> v3.3.8 前 `MODE=expert` 会设置 `model_type="expert"`；上游合并模式后该字段已被一律改写为 `"default"`，因此本项目把 `MODE` 降级为「只影响 thinking」的兼容开关（§7.6）。新配置请用 `MODEL_ROUTES` 或 `THINKING`。
 
 #### THINKING 详细说明
 
 | 值 | 效果 | thinking_enabled |
 |----|------|-----------------|
-| `auto` | 由客户端 request 中的 `thinking_mode` 决定 | `req.thinking_mode or False` |
+| `auto` | 由 `MODEL_ROUTES` 预设 / 客户端 `thinking_mode` 决定（旧 `MODE` 也在此级之前） | `decision.thinking` / `req.thinking_mode or False` |
 | `enabled` | 强制开启思考 | `True` |
 | `disabled` | 强制关闭思考 | `False` |
 
@@ -1813,44 +1914,44 @@ class ContentPart(BaseModel):
 
 | 值 | 效果 | search_enabled |
 |----|------|---------------|
-| `auto` | 由客户端 request 中的 `search_enabled` 决定 | `req.search_enabled or False` |
+| `auto` | 由 `MODEL_ROUTES` 预设 / 客户端 `search_enabled` 决定 | `decision.search` / `req.search_enabled or False` |
 | `enabled` | 强制开启联网搜索 | `True` |
 | `disabled` | 强制关闭联网搜索 | `False` |
 
-**重要：** 三个参数完全独立。`MODE=auto` 不等于"旧版 auto"——旧版中 `thinking_mode=true` 会同时设置 `model_type="expert"`。新版中每个维度由对应的环境变量独立控制。
+**重要：** 能力只剩 **thinking / search 两个独立维度**，且优先级为 `MODEL_ROUTES` → `THINKING`/`SEARCH` → 客户端字段 → 旧 `MODE`（v3.3.8，唯一实现入口 `resolve_model_controls()`）。`model_type` 不再是维度：它恒为 `"default"`（协议字段），`MODE` 也不再改它。
 
-#### MODE / THINKING / SEARCH 交互矩阵
+#### 能力交互矩阵（thinking × search）
 
-| MODE | THINKING | SEARCH | 实际行为 |
-|------|----------|--------|---------|
-| `auto` | `auto` | `auto` | model_type="default", thinking=客户端, search=客户端 |
-| `auto` | `enabled` | `auto` | model_type="default", thinking=true, search=客户端 |
-| `auto` | `disabled` | `auto` | model_type="default", thinking=false, search=客户端 |
-| `quick` | `auto` | `auto` | model_type="default", thinking=客户端, search=客户端 |
-| `quick` | `enabled` | `auto` | model_type="default", thinking=true, search=客户端 |
-| `quick` | `disabled` | `disabled` | model_type="default", thinking=false, search=false |
-| `expert` | `auto` | `auto` | model_type="expert", thinking=客户端, search=客户端 |
-| `expert` | `enabled` | `enabled` | model_type="expert", thinking=true, search=true |
-| `expert` | `disabled` | `auto` | model_type="expert", thinking=false, search=客户端 |
+| MODEL_ROUTES | THINKING | SEARCH | 实际行为 |
+|--------------|----------|--------|---------|
+| 命中 `deepseek-chat`（`"default"`） | `auto` | `auto` | thinking=false, search=客户端 |
+| 未配置 `MODEL_ROUTES`（默认） | `auto` | `auto` | thinking=客户端, search=客户端（旧 `MODE` 可在此前介入 thinking） |
+| 未配置 `MODEL_ROUTES`（默认） | `enabled` | `auto` | thinking=true, search=客户端 |
+| 未配置 `MODEL_ROUTES`（默认） | `disabled` | `auto` | thinking=false, search=客户端 |
+| 配置后命中某名字（`"thinking"`） | `auto` | `auto` | thinking=true, search=客户端 |
+| 未命中 | `auto` | `auto` | thinking=客户端, search=客户端（旧 `MODE` 可在此前介入 thinking） |
+| 未命中 | `enabled` | `auto` | thinking=true, search=客户端 |
+| 未命中 | `disabled` | `auto` | thinking=false, search=客户端 |
+| 未命中 | `enabled` | `disabled` | thinking=true, search=false |
+| 未命中 | `disabled` | `disabled` | thinking=false, search=false |
+| 未命中 | `auto` | `enabled` | thinking=客户端, search=true |
 
-所有 9 种组合均有效，`auto` 表示由客户端请求中的对应字段决定。
+所有组合均有效，`auto` 表示由客户端请求中的对应字段决定；任何组合下发往上游的 `model_type` 都是 `"default"`。
 
 修改 `.env` 后需要**重启服务器**才能生效（`load_dotenv()` 只在模块加载时调用一次）。
 
-### 13.2 加载方式
+### 14.2 加载方式
 
 ```python
 from dotenv import load_dotenv
 load_dotenv()
 
-TOKEN = os.environ.get("DEEPSEEK_TOKEN", "")
-COOKIES = os.environ.get("DEEPSEEK_COOKIES", "")
 MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-chat")
 ```
 
-同时 `adapter.py` 和 `server.py` 各自调用 `load_dotenv()`（dotenv 保证只加载一次）。
+账号凭证由 `AccountPool` 从 `data/accounts.json` 加载，或通过 WebUI 管理；`adapter.py` 构造时必须显式传入凭证。`adapter.py` 和 `server.py` 仍调用 `load_dotenv()` 读取其他运行配置。
 
-### 13.3 Token 和 Cookie 获取
+### 14.3 Token 和 Cookie 获取
 
 1. 打开 https://chat.deepseek.com 并登录
 2. F12 → Network → 任意请求
@@ -1860,7 +1961,7 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-chat")
 
 Token 和 Cookie 会过期，需定期更新。过期特征：PoW challenge 请求返回 `{"code":40003,"msg":"Authorization Failed (invalid token)"}`。
 
-### 13.4 WASM 二进制来源
+### 14.4 WASM 二进制来源
 
 `sha3_wasm_bg.wasm` 从 DeepSeek 前端中提取：
 
@@ -1883,7 +1984,7 @@ print("WASM valid")
 - 更新 WASM 后需检查导出函数名是否变化
 - 如果 `wasm_solve` 等导出函数不可用，需要同步更新 `_WASMSolver` 类
 
-### 13.5 httpx 客户端配置
+### 14.5 httpx 客户端配置
 
 ```python
 self._client = httpx.Client(timeout=120)
@@ -1896,14 +1997,14 @@ self._client = httpx.Client(timeout=120)
 | Keep-Alive | 默认启用 | 复用 HTTP 连接 |
 
 **120s 超时的选择理由：**
-- 专家模式 THINK 阶段可能持续 30-60s，需要足够等待时间
+- 开启思考后的 THINK 阶段可能持续 30-60s，需要足够等待时间
 - DeepSeek 服务端在长时间思考期间不会发送数据，短超时会误断连
 - 网页版实际超时约 180s，120s 是保守值
 - `timeout=120` 是所有子超时的总上限（connect/read/write/pool）
 
-如果使用短超时（如默认的 5s），专家模式会在 thinking 阶段频繁断连，表现为 `Server disconnected without sending a response`。
+如果使用短超时（如默认的 5s），开启思考的请求会在 THINK 阶段频繁断连，表现为 `Server disconnected without sending a response`。
 
-### 13.6 端口管理与进程控制
+### 14.6 端口管理与进程控制
 
 `start.bat` 的端口管理逻辑（结合 `PORT` 环境变量）：
 
@@ -1991,19 +2092,16 @@ def check_health(acct) -> bool:
 
 `AccountPool` 使用 `threading.Lock` 保护所有状态变更操作（CRUD、状态切换）。`_WASMSolver` 已有独立锁，两把锁不会形成死锁（无嵌套加锁）。
 
-### 15.7 初始加载与 env 兜底
+### 15.7 初始加载与配置来源
 
-- **池内账号**：启动时从 `data/accounts.json`（面板持久化）加载；面板/Admin API 增删改。
-- **env 兜底**：`.env` 中的凭证（numbered `DEEPSEEK_TOKEN_1/...` 优先，legacy `DEEPSEEK_TOKEN`/`DEEPSEEK_COOKIES` 其次）**不再预加载进池**，而是作为只读兜底账号（id=`env-*`，source=`env`，`read_only=true`）：
-  - 池内**有**账号时：只用池内账号（面板账号优先）
-  - 池内**0**个账号时：`acquire()` 返回 env 兜底账号，服务不因池空而 503
-  - webui 账号池页显示该条目（灰色只读），删除接口对 `env-*` 无效（不在池内，返回 404）
-  - 实现：`AccountPool._env_fallback`（`_load_env_fallback()`），`acquire()` 池空分支、`get_all()`/`stats()` 含兜底账号
+- **唯一账号来源**：启动时从 `data/accounts.json` 加载；WebUI/Admin API 的增删改也持久化到该文件。
+- `.env` 不加载账号凭证；`DeepSeekAdapter` 要求调用方显式传入 token 和 cookies。
+- 账号池为空时 `acquire()` 返回 `None`，请求无法选择上游账号；需先在 WebUI 添加账号或填充 `data/accounts.json`。
 
 ### 15.8 非交互式账号池配置（代理 / 自动化工具专用）
 
 > **场景**：给 SDK、脚本、curl、CI、代理等**不经过 WebUI 面板**的自动化工具配置多账号轮询。
-> **要点**：v3.0.0+ 账号池的**主配置源是 `data/accounts.json` 文件**，不是 `.env`。`.env` 只提供「单账号只读兜底」。要跑**多账号轮询**，非交互场景必须直接写 `data/accounts.json`。
+> **要点**：账号凭证只通过 WebUI 账号池或 `data/accounts.json` 配置。`.env` 不提供账号兜底；非交互部署直接维护 `data/accounts.json`。
 
 **`data/accounts.json` 完整 schema（v1 明文版）：**
 
@@ -2050,8 +2148,8 @@ chmod 700 /path/to/project/data
 # 2. 可选：改存储路径（不改则默认 data/accounts.json）
 #    .env 或环境变量设：ACCOUNT_STORE_PATH=/path/to/accounts.json
 
-# 3. 配置 API 鉴权（非交互必须，否则 /v1/* 报 503）
-#    API_KEYS=***   （多个逗号分隔)
+# 3. 在 WebUI「设置」页创建 API Key（非交互必须，否则 /v1/* 报 503）
+#    Key 哈希保存在 data/api_keys.sqlite3；明文仅在创建时显示一次
 
 # 4. 启动
 python -m uvicorn server:app --host 127.0.0.1 --port 8080
@@ -2059,7 +2157,6 @@ python -m uvicorn server:app --host 127.0.0.1 --port 8080
 
 - **加密存储（推荐公网）**：设 `DEEPSEEK_ENCRYPTION_KEY`(Fernet 32B base64)，首次启动会把 `version:1` 明文自动迁移为 `version:2` 加密，并留 `accounts.json.v1.bak`。此时**不要再手写明文文件**（会被 detect_store_version 判成 v2 encrypted 又无 key 而拒绝加载）。
 - **写入时机**：在服务**启动前**写文件，或运行中调 `POST /admin/api/accounts`(需 admin token)。服务启动时 `_load_persisted_accounts()` 一次性全量加载。
-- **只保留一个兜底账号**：直接用 `.env` 的 `DEEPSEEK_TOKEN_1/COOKIES_1`（或 legacy `DEEPSEEK_TOKEN/COOKIES`），池空自动兜底，不必写 accounts.json。
 
 ---
 
@@ -2107,7 +2204,7 @@ python -m uvicorn server:app --host 127.0.0.1 --port 8080
 - **技术栈**：Vite 5 + React 18 + TypeScript + shadcn/ui（Radix + Tailwind）+ Recharts + Zustand + react-router-dom v6
 - **路由**：`createBrowserRouter(..., { basename: '/webui' })`——SPA 位于 `/webui/*`，深链接刷新由 `server.py` 的 `/webui/{rest}` SPA fallback 回 index.html
 - **构建**：`webui-new/` 下 `npm install && npm run build`（或 `scripts/build.bat`），产物 `webui-new/dist/`。vite `base: '/webui/'` 使资源引用带前缀（改回 `/` 会导致 JS/CSS 404 白屏）
-- **鉴权**：admin token 存 `localStorage`（zustand persist，key `ds2api-auth`）；`api()` 包装器统一带 `Authorization: Bearer <admin-token>`，401 自动 logout 跳 `/login`。`/v1/*` 现也接受该 admin token（见 13.1/18.1）
+- **鉴权**：admin token 存 `localStorage`（zustand persist，key `ds2api-auth`）；`api()` 包装器统一带 `Authorization: Bearer <admin-token>`，401 自动 logout 跳 `/login`。`/v1/*` 现也接受该 admin token（见 14.1/18.1）
 - **页面**：登录 / 概览（统计卡 + 请求量/延迟 Recharts 图 + 账号池状态）/ 账号池（表格 + 抽屉详情 + 添加/编辑/删除 + 重登）/ Playground（流式对话，参数仅暴露后端真实转发的字段，reasoning 折叠显示）/ 设置（`/admin/api/env` 只读）/ 404
 - **主题**：浅色/深色/跟随系统，`localStorage` 持久化（key `ds2api-theme`），`main.tsx` 挂载前提前 `applyTheme` 防闪烁
 - **轮询**：概览页 stats 5s / accounts 10s / history 30s，账号页 10s（`useApi` hook 带 AbortController + reqId 防竞态）
@@ -2300,8 +2397,8 @@ yield "data: [DONE]\n\n"
 ### 18.1 认证相关
 
 - **Token/Cookie 过期**：不定期失效，需重新获取。没有自动续期机制（webui 账号池提供一键重登录）。
-- **账号来源**：`.env` 静态账号（`DEEPSEEK_TOKEN_n`/`DEEPSEEK_COOKIES_n` 或 legacy `DEEPSEEK_TOKEN`）与 webui 面板账号（`data/accounts.json`）双通道，账号池轮询分配。
-- **两套鉴权**：`/v1/*` 客户端用 `API_KEYS`（Bearer 或 `x-api-key`）；webui 管理端用 `DEEPSEEK_ADMIN_PASSWORD` 换 admin 会话 token。
+- **账号来源**：仅由 WebUI/Admin API 管理并持久化到 `data/accounts.json`，或直接维护该文件；`.env` 不加载账号凭证。
+- **两套鉴权**：`/v1/*` 客户端用 WebUI「设置」页管理的 API Key（Bearer 或 `x-api-key`，SQLite 仅存哈希）；webui 管理端用 `DEEPSEEK_ADMIN_PASSWORD` 换 admin 会话 token。旧版 `API_KEYS` / `DEEPSEEK_API_KEY` 仅首次创建 Key 数据库时导入。
 - **admin token 放行 `/v1/*`**（v2.2.0+ 行为）：`_check_api_auth` 先验证 `verify_admin_token()`，有效则放行——webui 用同一 token 调模型列表/Playground。持有 admin token 者本已能完全控制账号池，不扩大风险面。
 - **登录节流**：每 IP 5 次失败 / 300s 窗口，超限返回 429；计数为进程内存态，重启清零。
 
@@ -2315,6 +2412,7 @@ yield "data: [DONE]\n\n"
 | `temperature`/`top_p` 无效 | DeepSeek API 不支持 | 无法控制随机性 |
 | 无多模态 | 网页 API 不支持图片 | 仅文本交互 |
 | 非流式 OpenAI 端点不输出 reasoning_content | OpenAI 非流式响应模型未包含该字段 | 需要推理过程请用流式模式（Anthropic 非流式已支持 thinking 块） |
+| 上游偶尔只回 THINK 片段就结束（2026-10-18 实测） | 上游行为 | content 为空但 inish_reason 正常（stop）；客户端可能显示空回复，重试或改用直接回答 |
 
 ### 18.3 CORS 跨域支持
 
@@ -2413,8 +2511,9 @@ curl -s -X POST ... -d '{"messages":[{"role":"user","content":"hello"}],"stream"
 ```python
 # 模块级
 load_dotenv()
-MODE = os.environ.get("MODE", "auto").strip().lower()
+MODE = os.environ.get("MODE", "auto").strip().lower()      # 旧配置兼容：只影响 thinking（v3.3.8）
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
+MODEL_ROUTES = os.environ.get("MODEL_ROUTES", "")           # model 名 → 能力预设（推荐入口）
 ```
 
 这意味着**修改 `.env` 后必须重启服务器**才能生效。仅保存文件不会触发重新加载。使用 `--reload` 模式时 uvicorn 会检测文件变更然后重启，但 `.env` 变更不在 uvicorn 的文件监控范围内——需要手动重启。
@@ -2433,14 +2532,14 @@ print(f"Session: {sid}")
 
 预期输出：`Session: <uuid>`。如失败检查凭证是否过期。
 
-### 19.2 测试快速模式
+### 19.2 测试直接回答（快速模式）
 
 ```python
 content = adapter.chat(sid, "User: 你好")
 print(f"Reply: {content}")
 ```
 
-### 19.3 测试专家模式
+### 19.3 测试开启思考（原「专家模式」）
 
 ```python
 content = adapter.chat(sid, "User: 思考一个哲学问题",
@@ -2448,7 +2547,7 @@ content = adapter.chat(sid, "User: 思考一个哲学问题",
 print(f"Reply: {content}")
 ```
 
-### 16.4 测试专家模式流式
+### 19.4 测试开启思考流式（原「专家模式」）
 
 ```python
 for token in adapter.chat_stream(sid, "User: 你好",
@@ -2462,7 +2561,7 @@ for token in adapter.chat_stream(sid, "User: 你好",
         print(token, end="")
 ```
 
-### 16.5 原始 SSE 抓包
+### 19.5 原始 SSE 抓包
 
 修改 `chat_stream()` 或使用以下片段打印原始 SSE：
 
@@ -2473,7 +2572,7 @@ for line in resp.iter_lines():
     print(line)
 ```
 
-### 16.6 使用 curl 快速测试
+### 19.6 使用 curl 快速测试
 
 **健康检查：**
 ```bash
@@ -2499,7 +2598,7 @@ curl -X POST http://localhost:8080/v1/chat/completions ^
   -d "{\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}],\"stream\":true}"
 ```
 
-**专家模式（流式）：**
+**开启思考（流式）：**
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions ^
   -H "Content-Type: application/json" ^
@@ -2513,7 +2612,7 @@ curl -X POST http://localhost:8080/v1/chat/completions ^
   -d "{\"messages\":[{\"role\":\"user\",\"content\":\"北京天气怎么样？\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"获取天气\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}]}"
 ```
 
-### 16.7 排查步骤（按优先级排序）
+### 19.7 排查步骤（按优先级排序）
 
 当服务异常时的系统化排查流程：
 
@@ -2521,16 +2620,16 @@ curl -X POST http://localhost:8080/v1/chat/completions ^
 2. **凭证有效性** → `adapter.create_session()` 是否成功？
 3. **PoW 求解** → WASM 是否正常加载？
 4. **快速模式** → 最基本的 `adapter.chat(sid, "User: 你好")` 是否返回？
-5. **专家模式** → `thinking_enabled=True` 是否触发 fragment 状态机？
+5. **开启思考** → `thinking_enabled=True` 是否触发 fragment 状态机？
 6. **流式输出** → `chat_stream()` 能否逐 token 产出？
 7. **工具调用** → DSML 标签是否被 StreamSieve 正确捕获？
 
-### 16.8 常见错误
+### 19.8 常见错误
 
 | 错误信息 | 可能原因 | 解决 |
 |---------|---------|------|
 | `Authorization Failed (invalid token)` | Token 过期 | 更新 .env |
-| `Update to the latest version to use Expert` | X-App-Version 版本过低 | 改为 `20241129.1` |
+| `Update to the latest version to use Expert`（历史） | 旧 `X-App-Version` 过低；该头自 v3.2.0 起已不再发送 | 当前版本判断基于 `X-Client-Version`（2.3.0，见 §7.7）；该 toast 已由 adapter 解析并透出 |
 | `WASM solver found no solution` | PoW 难度过高/求解异常 | 重试 |
 | `Session creation failed` | PoW 过期/凭证无效 | 重试/更新凭证 |
 | `Server disconnected without sending a response` | DeepSeek 服务端超时或 httpx 超时太短 | 检查 timeout=120；重试 |
@@ -2540,7 +2639,7 @@ curl -X POST http://localhost:8080/v1/chat/completions ^
 | `PoWError: WASM solver found no solution` | WASM 二进制不兼容 | 检查 wasmtime 版本或重新提取 WASM |
 | 进程已退出但端口仍占用 | 前一个 uvicorn 未完全终止 | 用 `netstat -ano | findstr :<PORT>` 找到 PID 后 taskkill |
 
-### 16.9 使用 HAR 分析
+### 19.9 使用 HAR 分析
 
 1. 浏览器 F12 → Network → 导出 HAR
 2. 用 `jq` 或 Python 解析：
@@ -2592,12 +2691,12 @@ DeepSeek 可能引入新的反爬机制：
 
 1. **定期抓包**（至少每月一次）
 2. **HAR 对比**：保存基线 HAR 文件，对比差异
-3. **降级方案**：当专家模式失效时，至少保证快速模式可用
+3. **降级方案**：`thinking_enabled=true` 失效时至少保证直接回答可用（`model_type` 已无能力含义，不再是降级维度）
 4. **抓包要点**：
    - 关注 `chat_session/create` 和 `chat/completion` 两个核心端点
    - 记录所有请求头，特别关注 `X-` 开头的自定义头
    - 记录 SSE 事件序列，注意新增的 `p` 路径或 `o` 操作
-   - 关注 `model_type` 字段的枚举值变化
+   - 关注 `model_type` 字段的枚举值变化（2026-10 起上游恒回 `"default"`；若重新出现 `expert`/`vision`，说明上游放开了模式，需同步调整 `MODEL_ROUTES`）
 
 ### 17.5 WASM 二进制更新流程
 

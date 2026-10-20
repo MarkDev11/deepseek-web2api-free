@@ -89,7 +89,7 @@ export default function AccountsPage() {
               <Users className="mx-auto h-10 w-10 text-muted-foreground/40" />
               <h3 className="mt-3 text-sm font-medium">No accounts</h3>
               <p className="mt-1 text-xs text-muted-foreground">
-                Click "Add account" to create a persistent account, or set DEEPSEEK_TOKEN_1/2/... in .env
+                Click "Add account" in the top-right corner, or write accounts to data/accounts.json.
               </p>
             </div>
           ) : (

@@ -70,8 +70,8 @@ def test_cache_keys_are_isolated_between_api_keys():
     request_b = type("Request", (), {
         "headers": {"Authorization": "Bearer api-key-b"},
     })()
-    assert server._cache_key(request_a, "nonstream", "user:alice") != \
-        server._cache_key(request_b, "nonstream", "user:alice")
+    assert server._cache_key(request_a, "user:alice") != \
+        server._cache_key(request_b, "user:alice")
 
 
 def test_acquire_prefers_the_account_bound_to_cached_session(monkeypatch):

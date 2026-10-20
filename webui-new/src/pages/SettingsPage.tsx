@@ -1,4 +1,5 @@
 import { PageHeader } from '@/components/layout/PageHeader'
+import { ApiKeyManager } from '@/components/settings/ApiKeyManager'
 import { EnvPreview } from '@/components/settings/EnvPreview'
 
 export default function SettingsPage() {
@@ -6,8 +7,9 @@ export default function SettingsPage() {
     <div className="space-y-6 animate-fade-in">
       <PageHeader
         title="Settings"
-        description="View the effective runtime configuration (read-only)"
+        description="Manage client API keys and view the current runtime configuration"
       />
+      <ApiKeyManager />
       <EnvPreview />
     </div>
   )
