@@ -25,11 +25,21 @@ def make_jwt(exp):
 class FakeAdapter:
     """Stands in for DeepSeekAdapter on one account."""
 
-    def __init__(self, token=None, cookies=None, error=None):
+    def __init__(self, token=None, cookies=None, error=None, check=None):
         self.token = token
         self.cookies = cookies
         self.error = error
         self.calls = 0
+        self.checks = 0
+        self._check = check
+
+    def check_credentials(self):
+        """Stands in for the GET that asks whether the token still works."""
+        self.checks += 1
+        if self._check is not None:
+            return dict(self._check)
+        return {"ok": True, "code": 0, "msg": "",
+                "path": "/api/v0/users/settings", "detail": ""}
 
     def refresh_credentials(self):
         self.calls += 1
@@ -54,6 +64,9 @@ def pool_env(monkeypatch, tmp_path):
     monkeypatch.setattr(account_pool, "TOKEN_REFRESH_AHEAD_SECS", 900)
     monkeypatch.setattr(account_pool, "TOKEN_REFRESH_MIN_INTERVAL_SECS", 0)
     monkeypatch.delenv("DEEPSEEK_ENCRYPTION_KEY", raising=False)
+    # These tests describe the renew path; the shipped default is verify-only
+    # because the upstream has no refresh endpoint (see TestCredentialCheck).
+    monkeypatch.setattr(account_pool.adapter_module, "REFRESH_PATHS", ["/api/v0/auth/refresh"])
     return tmp_path
 
 
@@ -259,3 +272,72 @@ class TestAdminRefreshEndpoint:
         pool.mark_error(acct, "credentials rejected: 40003")
         time.sleep(0.2)
         assert calls == []
+
+
+DEAD = {"ok": False, "code": 40003, "msg": "Authorization Failed (invalid token)",
+        "path": "/api/v0/users/settings", "detail": "token rejected by upstream"}
+
+
+class TestCredentialCheck:
+    """With no refresh endpoint configured, Refresh verifies instead of renewing."""
+
+    def test_live_credentials_are_reported_without_a_refresh_call(self, pool_env, monkeypatch):
+        monkeypatch.setattr(account_pool.adapter_module, "REFRESH_PATHS", [])
+        pool = AccountPool()
+        fake = FakeAdapter()
+        acct = _account(pool, adapter=fake)
+        acct.state = "error"
+        acct.error_count = 3
+
+        ok, msg = pool.refresh_by_id(acct.id)
+        assert ok is True and "credentials valid" in msg
+        assert fake.checks == 1 and fake.calls == 0
+        assert acct.last_refresh_status == "ok" and acct.last_refresh_error == ""
+        assert acct.state == "idle" and acct.error_count == 0
+
+    def test_dead_token_tells_the_user_what_to_do(self, pool_env, monkeypatch):
+        monkeypatch.setattr(account_pool.adapter_module, "REFRESH_PATHS", [])
+        pool = AccountPool()
+        fake = FakeAdapter(check=DEAD)
+        acct = _account(pool, adapter=fake)
+        acct.state = "error"
+        acct.error_count = 2
+
+        ok, msg = pool.refresh_by_id(acct.id)
+        assert ok is False
+        assert "40003" not in msg  # the code is on the check, the advice is in the message
+        assert "copy a fresh token" in msg
+        assert fake.calls == 0, "a dead token cannot mint a new one, so no POST"
+        assert acct.last_refresh_status == "failed"
+        assert "copy a fresh token" in acct.last_refresh_error
+        # A failed check must not resurrect a quarantined account.
+        assert acct.state == "error" and acct.error_count == 2
+
+    def test_transport_failure_is_recorded_verbatim(self, pool_env, monkeypatch):
+        monkeypatch.setattr(account_pool.adapter_module, "REFRESH_PATHS", [])
+        pool = AccountPool()
+        fake = FakeAdapter(check={"ok": False, "code": None, "msg": "",
+                                  "path": "/api/v0/users/settings",
+                                  "detail": "Timeout: connect timed out"})
+        acct = _account(pool, adapter=fake)
+        ok, msg = pool.refresh_by_id(acct.id)
+        assert ok is False and "Timeout" in msg
+        assert acct.last_refresh_error == "Timeout: connect timed out"
+
+    def test_check_outcome_survives_a_restart(self, pool_env, monkeypatch):
+        monkeypatch.setattr(account_pool.adapter_module, "REFRESH_PATHS", [])
+        pool = AccountPool()
+        acct = _account(pool, adapter=FakeAdapter(check=DEAD))
+        pool.refresh_by_id(acct.id)
+        reloaded = AccountPool()
+        row = next(a for a in reloaded._accounts if a.id == acct.id)
+        assert row.last_refresh_status == "failed"
+        assert "copy a fresh token" in row.last_refresh_error
+
+    def test_refresh_still_renews_when_an_endpoint_exists(self, pool_env):
+        pool = AccountPool()
+        fake = FakeAdapter(token=make_jwt(int(time.time()) + 5400))
+        acct = _account(pool, adapter=fake)
+        ok, msg = pool.refresh_by_id(acct.id)
+        assert ok is True and "auth/refresh" in msg
+        assert fake.checks == 1 and fake.calls == 1

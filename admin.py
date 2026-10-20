@@ -450,7 +450,8 @@ async def env_info(request: Request):
             {"name": "TOKEN_REFRESH_ENABLED", "value": _env("TOKEN_REFRESH_ENABLED") or "1", "is_default": _flag("TOKEN_REFRESH_ENABLED") == "default"},
             {"name": "TOKEN_REFRESH_AHEAD_SECS", "value": _env("TOKEN_REFRESH_AHEAD_SECS") or "900", "is_default": _flag("TOKEN_REFRESH_AHEAD_SECS") == "default"},
             {"name": "TOKEN_REFRESH_MIN_INTERVAL_SECS", "value": _env("TOKEN_REFRESH_MIN_INTERVAL_SECS") or "300", "is_default": _flag("TOKEN_REFRESH_MIN_INTERVAL_SECS") == "default"},
-            {"name": "DEEPSEEK_REFRESH_PATHS", "value": _env("DEEPSEEK_REFRESH_PATHS") or "/api/v0/auth/refresh,/api/v0/user/refresh_token", "is_default": _flag("DEEPSEEK_REFRESH_PATHS") == "default"},
+            {"name": "DEEPSEEK_REFRESH_PATHS", "value": _env("DEEPSEEK_REFRESH_PATHS") or "(empty - verify only)", "is_default": _flag("DEEPSEEK_REFRESH_PATHS") == "default"},
+            {"name": "DEEPSEEK_CREDENTIAL_CHECK_PATH", "value": _env("DEEPSEEK_CREDENTIAL_CHECK_PATH") or "/api/v0/users/settings", "is_default": _flag("DEEPSEEK_CREDENTIAL_CHECK_PATH") == "default"},
         ],
         "credential_store": credential_store.describe(),
     }

@@ -124,7 +124,13 @@ class _FakeClient:
         self.cookies = _FakeJar(cookies or {})
 
     def post(self, url, json=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "headers": dict(headers or {})})
+        return self._send("POST", url, headers)
+
+    def get(self, url, headers=None, timeout=None):
+        return self._send("GET", url, headers)
+
+    def _send(self, method, url, headers):
+        self.calls.append({"method": method, "url": url, "headers": dict(headers or {})})
         item = self._responses.pop(0) if self._responses else _FakeResponse(None, 404)
         if isinstance(item, Exception):
             raise item
@@ -138,13 +144,76 @@ def adapter():
     return DeepSeekAdapter(token="old-token", cookies="cf_clearance=abc; sid=1")
 
 
+class TestCheckCredentials:
+    """adapter.check_credentials(): what the panel's Refresh button really does."""
+
+    def _with_client(self, adapter, responses):
+        adapter._client = _FakeClient(responses)
+        return adapter._client
+
+    def test_defaults_match_the_measured_upstream(self):
+        import os
+        import adapter as adapter_module
+        # Measured 2026-10-20: no refresh endpoint exists, /api/v0/users/settings
+        # is the authenticated probe. Pinned unless the env says otherwise.
+        if not os.environ.get("DEEPSEEK_CREDENTIAL_CHECK_PATH"):
+            assert adapter_module.CREDENTIAL_CHECK_PATH == "/api/v0/users/settings"
+        if not os.environ.get("DEEPSEEK_REFRESH_PATHS"):
+            assert adapter_module.REFRESH_PATHS == []
+
+    def test_live_token_is_a_get_and_reports_ok(self, adapter):
+        from adapter import BASE_URL
+        client = self._with_client(adapter, [_FakeResponse({"code": 0, "data": {"biz_code": 0}})])
+        res = adapter.check_credentials()
+        assert res["ok"] is True and res["code"] == 0 and res["detail"] == ""
+        assert client.calls[0]["method"] == "GET"
+        assert client.calls[0]["url"] == BASE_URL + "/api/v0/users/settings"
+        assert client.calls[0]["headers"]["Authorization"] == "Bearer old-token"
+
+    def test_rejected_token_is_negative_not_an_error(self, adapter):
+        res = adapter.check_credentials() if self._with_client(
+            adapter,
+            [_FakeResponse({"code": 40003, "msg": "Authorization Failed (invalid token)"})],
+        ) else None
+        assert res["ok"] is False
+        assert res["code"] == 40003
+        assert res["detail"] == "token rejected by upstream"
+
+    def test_non_json_body_reports_the_status(self, adapter):
+        self._with_client(adapter, [_FakeResponse(None, 200)])
+        res = adapter.check_credentials()
+        assert res["ok"] is False and "non-JSON" in res["detail"]
+
+    def test_waf_challenge_is_named(self, adapter):
+        self._with_client(adapter, [_FakeResponse(None, 202, {"x-amzn-waf-action": "challenge"})])
+        res = adapter.check_credentials()
+        assert res["ok"] is False and "challenge" in res["detail"]
+
+    def test_transport_error_is_captured(self, adapter):
+        self._with_client(adapter, [TimeoutError("timed out")])
+        res = adapter.check_credentials()
+        assert res["ok"] is False and "TimeoutError" in res["detail"]
+
+    def test_unexpected_code_is_not_ok(self, adapter):
+        self._with_client(adapter, [_FakeResponse({"code": 500, "msg": "internal"})])
+        res = adapter.check_credentials()
+        assert res["ok"] is False and "500" in res["detail"]
+
+    def test_blank_path_disables_the_check(self, adapter, monkeypatch):
+        monkeypatch.setattr("adapter.CREDENTIAL_CHECK_PATH", "")
+        res = adapter.check_credentials()
+        assert res["ok"] is False and "no credential check path" in res["detail"]
+
+
 class TestRefreshCredentials:
     def _with_client(self, adapter, responses, cookies=None):
         adapter._client = _FakeClient(responses, cookies)
         return adapter._client
 
-    def test_working_path_updates_token_headers_and_cookies(self, adapter):
+    def test_working_path_updates_token_headers_and_cookies(self, adapter, monkeypatch):
         from adapter import BASE_URL
+        # Renewal is opt-in now: the upstream has no refresh endpoint by default.
+        monkeypatch.setattr("adapter.REFRESH_PATHS", ["/api/v0/auth/refresh"])
         new_tok = make_jwt(int(time.time()) + 3600)
         client = self._with_client(
             adapter,

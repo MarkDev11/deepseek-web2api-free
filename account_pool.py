@@ -17,6 +17,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 import credential_store
+import adapter as adapter_module
 from adapter import DeepSeekAdapter
 from credentials import (
     is_auth_failure,
@@ -528,8 +529,58 @@ class AccountPool:
                 acct._refreshing = False
             log.warning("credential_refresh_crashed", extra={"id": acct.id, "error": str(e)})
 
+    def _record_check_locked(self, acct: Account, check: dict) -> tuple[bool, str]:
+        """Record a credential check on the account and persist it.
+
+        A positive check is all this deployment can do: chat.deepseek.com mints
+        its token at login and offers no endpoint to renew it (see
+        adapter.CREDENTIAL_CHECK_PATH), so the panel's Refresh verifies rather
+        than renews. Only a success may lift a quarantined account - a failed
+        check must not mark a dead account healthy again.
+        """
+        detail = check.get("detail") or check.get("msg") or "credential check failed"
+        if not check.get("ok") and is_auth_failure(check.get("code"), check.get("msg") or ""):
+            detail += " - copy a fresh token and cookies from the browser into this account"
+        with self._lock:
+            acct.last_refresh_at = _now()
+            acct.last_refresh_status = "ok" if check.get("ok") else "failed"
+            acct.last_refresh_error = "" if check.get("ok") else detail
+            if check.get("ok"):
+                if acct.state == "error":
+                    acct.state = "idle"
+                acct.error_count = 0
+                acct.last_error = ""
+            persist_error = ""
+            try:
+                self._save_persisted_accounts_locked()
+            except Exception as e:  # noqa: BLE001 - recorded in memory regardless
+                persist_error = str(e)
+                log.error("credential_check_not_persisted",
+                          extra={"id": acct.id, "error": persist_error,
+                                 "backend": credential_store.backend()})
+            acct._refreshing = False
+        if check.get("ok"):
+            msg = f"credentials valid (verified via {check.get('path')})"
+        else:
+            msg = f"credentials not confirmed: {detail} (via {check.get('path')})"
+        if persist_error:
+            msg += f" (warning: not persisted: {persist_error})"
+        return bool(check.get("ok")), msg
+
     def _do_refresh(self, acct: Account, reason: str) -> tuple[bool, str]:
-        """Perform the refresh for an account already claimed by `_refreshing`."""
+        """Verify an account's credentials, renewing them only where the upstream
+        offers an endpoint for it. Caller already claimed `_refreshing`.
+        """
+        check = acct.adapter.check_credentials()
+        if not check["ok"]:
+            log.warning("credential_check_failed",
+                        extra={"id": acct.id, "reason": reason,
+                               "code": check.get("code"),
+                               "error": check.get("detail") or check.get("msg")})
+            return self._record_check_locked(acct, check)
+        if not adapter_module.REFRESH_PATHS:
+            # Nothing to renew with; the check above is the whole answer.
+            return self._record_check_locked(acct, check)
         try:
             info = acct.adapter.refresh_credentials()
         except Exception as e:  # includes UpstreamAuthError / CredentialRefreshError

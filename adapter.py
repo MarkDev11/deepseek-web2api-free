@@ -65,17 +65,26 @@ try:
 except ValueError:
     RATE_LIMIT_RETRY_DELAYS = []
 
-# Credential refresh endpoints, tried in order (see refresh_credentials()).
-# The contract is NOT verified against a live account: chat.deepseek.com's SPA
-# is served behind an AWS WAF JS challenge, so its bundle cannot be read
-# server-side to confirm the path. Hence the list is configurable — if the
-# upstream endpoint moves, set DEEPSEEK_REFRESH_PATHS without a code change.
+# Credential renewal endpoints, tried in order (see refresh_credentials()).
+# Empty by default, measured 2026-10-20: chat.deepseek.com has no token-refresh
+# endpoint. Reading the app bundle (fe-static.deepseek.com/chat/static/main.*.js)
+# yields 46 /api/v0/ paths and none of them mints a token - the bearer token is
+# issued at login, kept in localStorage.userToken, and only a browser login
+# replaces it. The two paths this list used to try by default answer 200 with the
+# SPA's index.html (as does any unknown /api/ path), which surfaced as
+# "HTTP 200, non-JSON body". Set DEEPSEEK_REFRESH_PATHS if that ever changes.
 REFRESH_PATHS = [
-    x.strip() for x in os.environ.get(
-        "DEEPSEEK_REFRESH_PATHS",
-        "/api/v0/auth/refresh,/api/v0/user/refresh_token",
-    ).split(",") if x.strip()
+    x.strip() for x in os.environ.get("DEEPSEEK_REFRESH_PATHS", "").split(",") if x.strip()
 ]
+
+# What the panel's Refresh button can actually do: ask whether the credentials it
+# already has still work. GET /api/v0/users/settings is the lightest
+# authenticated endpoint - a live token gets {"code":0}, a dead one
+# {"code":40003,"msg":"Authorization Failed (invalid token)"}, verified against a
+# real account and a deliberately broken token.
+CREDENTIAL_CHECK_PATH = os.environ.get(
+    "DEEPSEEK_CREDENTIAL_CHECK_PATH", "/api/v0/users/settings",
+).strip()
 try:
     REFRESH_TIMEOUT_SECS = max(1.0, float(os.environ.get("DEEPSEEK_REFRESH_TIMEOUT_SECS", "20") or 20))
 except ValueError:
@@ -616,6 +625,49 @@ class DeepSeekAdapter:
 
         raise CredentialRefreshError(
             "credential refresh failed: " + (" | ".join(notes) or "no refresh paths configured"))
+
+    def check_credentials(self) -> dict:
+        """Ask the upstream whether this account's token is still accepted.
+
+        Returns {"ok", "code", "msg", "path", "detail"}. A rejected credential is
+        the normal negative answer, not an exception: the caller has to record it
+        on the account and tell the user what to do instead.
+        """
+        path = CREDENTIAL_CHECK_PATH
+        if not path:
+            return {"ok": False, "code": None, "msg": "", "path": "",
+                    "detail": "no credential check path configured"}
+        try:
+            resp = self._client.get(
+                f"{BASE_URL}{path}", headers=self._base_headers,
+                timeout=REFRESH_TIMEOUT_SECS,
+            )
+        except Exception as e:
+            return {"ok": False, "code": None, "msg": "", "path": path,
+                    "detail": f"{type(e).__name__}: {e}"}
+
+        kind = self._detect_waf_challenge(resp.status_code, resp.headers)
+        if kind:
+            return {"ok": False, "code": resp.status_code, "msg": "", "path": path,
+                    "detail": f"{kind} ({resp.status_code})"}
+        try:
+            payload = resp.json()
+        except Exception:
+            return {"ok": False, "code": resp.status_code, "msg": "", "path": path,
+                    "detail": f"HTTP {resp.status_code}, non-JSON body"}
+
+        code = payload.get("code") if isinstance(payload, dict) else None
+        msg = str(payload.get("msg") or "") if isinstance(payload, dict) else ""
+        if code == 0:
+            return {"ok": True, "code": 0, "msg": msg, "path": path, "detail": ""}
+        if is_auth_failure(code, msg):
+            return {"ok": False, "code": code, "msg": msg, "path": path,
+                    "detail": "token rejected by upstream"}
+        if code is not None:
+            return {"ok": False, "code": code, "msg": msg, "path": path,
+                    "detail": f"unexpected code {code}"}
+        return {"ok": False, "code": None, "msg": msg, "path": path,
+                "detail": "no code in response"}
 
     def _parse_sse(self, text: str):
         """Parse SSE text into a list of events"""

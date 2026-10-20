@@ -18,7 +18,7 @@
 |------|------|------|
 | 主动 | `AccountPool.acquire()` / `acquire_by_id()` | token 进入 `TOKEN_REFRESH_AHEAD_SECS`（默认 900s）窗口时在**后台线程**刷新；请求本身不等待 |
 | 被动 | `AccountPool.mark_error()` + `AcquiredAccount.create_session()` | 上游拒绝凭证（HTTP 200 + `{"code":40003,"msg":"Authorization Failed (invalid token)"}`，**不是 401**）时刷新；`create_session()` 同步刷新并**重试一次**，让当次请求仍可成功 |
-| 手动 | WebUI「账号池 → Refresh」/ `POST /admin/api/accounts/{id}/refresh` | 同步刷新并把结果写回存储 |
+| 手动 | WebUI「账号池 → Refresh」/ `POST /admin/api/accounts/{id}/refresh` | 同步**校验**凭证（仅当配了刷新端点时才续签）并写回存储 |
 
 **模块划分**
 
@@ -26,12 +26,12 @@
 |------|------|
 | `credentials.py` | 纯函数：JWT `exp` 解码、`should_refresh()`、`is_auth_failure()`（40003 / 文案标记）、多形态 token 提取、cookie blob 合并；无网络、无全局 |
 | `credential_store.py` | 账号文档存储后端：`KV_REST_API_URL` + `KV_REST_API_TOKEN` 同时存在时 **Vercel KV**（Upstash REST，值 base64 单行）为权威、`ACCOUNT_STORE_PATH` 为镜像/兜底；否则纯文件后端。KV 写失败抛 `CredentialStoreError`，不静默丢凭证 |
-| `adapter.py` | `refresh_credentials()` 依次尝试 `DEEPSEEK_REFRESH_PATHS`，**就地**替换 token（保留 cookie jar 与 PoW solver，不打断在途请求）、`set_token()`/`cookie_blob()`/`token_expires_at`；新增 `UpstreamAuthError`、`CredentialRefreshError` |
+| `adapter.py` | `check_credentials()` 校验凭证是否仍被接受（见下「上游没有刷新端点」）；`refresh_credentials()` 依次尝试 `DEEPSEEK_REFRESH_PATHS`，**就地**替换 token（保留 cookie jar 与 PoW solver，不打断在途请求）、`set_token()`/`cookie_blob()`/`token_expires_at`；新增 `UpstreamAuthError`、`CredentialRefreshError` |
 | `account_pool.py` | `Account` 新增 `token_expires_at` / `last_refresh_at` / `last_refresh_status` / `last_refresh_error`（随 `to_store_dict()` 持久化）；`refresh_account()`/`refresh_by_id()`/`_schedule_refresh_locked()`（冷却 `TOKEN_REFRESH_MIN_INTERVAL_SECS` + 并发合并） |
 | `admin.py` | `POST /accounts/{id}/refresh`；`/admin/api/env` 增加 5 条 refresh 变量与 `credential_store` 后端信息 |
 | `webui-new` | 账号表新增「Token expiry」徽章与「Refresh」按钮；账号抽屉新增 Token refresh 区块 |
 
-**已知未证实项**：刷新端点路径无法从服务端证实——chat.deepseek.com 的 SPA bundle 在 AWS WAF 的 JS 挑战之后，服务器端拿不到脚本正文。因此：路径可用 `DEEPSEEK_REFRESH_PATHS` 覆盖；响应解析对 4 种常见包装做了容错；失败原因完整写入 `last_refresh_error`，面板与日志（`credential_refresh_failed`）都能看到。**首次在有凭证的环境上请点一次手动 Refresh 验证**：报 `HTTP 404` 就把浏览器 DevTools 里真实的刷新路径填进 `DEEPSEEK_REFRESH_PATHS`；报 `no token in response` 说明响应结构变化，按实际结构补 `credentials._TOKEN_KEYS`。JWT 的 `exp` 与 40003 判定不依赖该端点，二者已用真实响应样本验证。
+**上游没有刷新端点（2026-10-20 实测，推翻原先的「未证实项」）**：账号存进去之后点 Refresh 报 `credential refresh failed: /api/v0/auth/refresh: HTTP 200, non-JSON body | /api/v0/user/refresh_token: HTTP 200, non-JSON body`。**不是 WAF 拦路**：直接用 urllib 下载 `fe-static.deepseek.com/chat/static/main.a34f79a498.js` 就能读到正文（1.57 MB，无挑战），里面一共出现 **46 条 `/api/v0/` 路径，没有任何一条会签发 token**（最接近的 `/api/v0/auth/ticket` 只是 `{scope:"tts"}` 的语音合成票据）。chat.deepseek.com 的 bearer token 在**登录时**签发、存在 `localStorage.userToken`，只有重新登录才会更换。未知的 `/api/` 路径一律回 SPA 的 `index.html`（HTTP 200 + HTML，8301 字节），这就是「non-JSON body」的来源——同一个现象也出现在并不存在的 `/api/v0/user/balance` 上，而 `create_session()` 仍返回 JSON，证明凭证和路由都正常。**结论与改法**：`DEEPSEEK_REFRESH_PATHS` 默认改成**空**（将来上游真提供续签端点时再填），Refresh 的语义改成**校验**——新增 `adapter.check_credentials()`，GET `DEEPSEEK_CREDENTIAL_CHECK_PATH`（默认 `/api/v0/users/settings`，实测活 token 回 `{"code":0,"data":{"biz_code":0,...}}`、乱填的 token 回 `{"code":40003,"msg":"Authorization Failed (invalid token)"}`，正好是本就赖以判定失效的那个信号）。`AccountPool._do_refresh()` 先校验：通过则写 `last_refresh_status="ok"`、解除 `error` 隔离并持久化；失败（尤其 40003）写 `last_refresh_error`（附「从浏览器把新的 token 和 cookie 复制进这个账号」的提示）、**不**解除隔离；只有 `DEEPSEEK_REFRESH_PATHS` 非空时才继续尝试原来的续签请求。日志新增 `credential_check_failed` / `credential_check_not_persisted`，`/admin/api/env` 新增 `DEEPSEEK_CREDENTIAL_CHECK_PATH` 一行。**换句话说：token 失效时唯一真正的修复是把浏览器里的新凭证贴进 WebUI，自动化的部分现在能准确地告诉你这件事。**回归测试见 `tests/test_credential_refresh.py::TestCheckCredentials` 与 `tests/test_account_pool_refresh.py::TestCredentialCheck`。
 
 **与上游的差异**：上游只把账号写在 `ACCOUNT_STORE_PATH`（Vercel 上是 `/tmp`，冷启动即失效 → 刷新结果会丢失），本 fork 因此引入 KV 后端。加密不变：同一个 `DEEPSEEK_ENCRYPTION_KEY`（Fernet）同样作用于 KV 中的值。
 
