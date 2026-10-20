@@ -35,6 +35,8 @@
 
 **与上游的差异**：上游只把账号写在 `ACCOUNT_STORE_PATH`（Vercel 上是 `/tmp`，冷启动即失效 → 刷新结果会丢失），本 fork 因此引入 KV 后端。加密不变：同一个 `DEEPSEEK_ENCRYPTION_KEY`（Fernet）同样作用于 KV 中的值。
 
+**KV 从哪来（2026-10-20 实测）**：`credential_store.py` 说的是 **Upstash REST 原生协议**（`POST {KV_REST_API_URL}/{command}` + 参数按换行分隔 + `Authorization: Bearer {KV_REST_API_TOKEN}`），不依赖任何 SDK，也不依赖 Vercel 的打包版 KV。Vercel 新项目的 Storage 面板里可能已经没有「KV Store」只剩「Global Config Store」（那是配置/特性开关存储，不适合运行时写凭证），此时直接在 console.upstash.com 建免费库，把控制台里的 REST API URL 与 Token 手动填进 Vercel 环境变量（Production 与 Preview 都要）即可，`KV_ACCOUNTS_KEY` 只是库内的键名。判断是否生效：`/admin/api/env` 的 `credential_store` 后端应为 `vercel_kv`（名称沿用历史，含义是「Upstash REST 后端」）。
+
 **只读文件系统下的启动保护（本 fork 修复）**：`server.py` 在 **import 阶段**就调用 `api_key_store.get_api_key_store()`，而 Vercel 上项目目录只读、`data/` 又被 `.vercelignore` 排除，于是 `mkdir` 抛错、整个 import 失败 —— 表现是**所有路由 500（FUNCTION_INVOCATION_FAILED）**，而不是某个功能降级。修复分两层：`vercel.json` + `api/index.py` 同时把 `ACCOUNT_STORE_PATH` 与 `API_KEY_STORE_PATH` 默认到 `/tmp`（用户显式配置优先）；`api_key_store._ensure_writable()` 在任何环境下检测「目录能否真的写入」，不可写时打 `api_key_store_path_unwritable` 告警并退到系统临时目录（键仍可用，只是不跨冷启动）。**客户端 API Key 目前不入 KV**，冷启动后需在 WebUI 重新生成（后续若要持久化，做法与账号池相同：抽出 KV 后端 + 保留 sqlite 作为缓存）。
 
 ---
