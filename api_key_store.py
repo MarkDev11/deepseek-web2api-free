@@ -9,9 +9,14 @@ import hashlib
 import os
 import secrets
 import sqlite3
+import tempfile
 import threading
 import time
 from pathlib import Path
+
+from logger import get_logger
+
+log = get_logger("api_key_store")
 
 
 _DEFAULT_PATH = Path(__file__).resolve().parent / "data" / "api_keys.sqlite3"
@@ -38,6 +43,29 @@ def _legacy_keys_from_env() -> list[str]:
             keys.append(key)
     return keys
 
+
+def _ensure_writable(path: Path) -> Path:
+    """Keep the key store on a filesystem the process can actually write to.
+
+    `server.py` builds this store at import time, so an unwritable path is not a
+    degraded feature but a dead process: on serverless hosts (Vercel) the project
+    directory is read-only, `data/` is not even part of the bundle, and `mkdir`
+    there raises before a single request is served - every route then answers 500.
+    Falling back to the temp directory keeps the instance alive; the warning says
+    where the keys actually live and that they only last as long as the instance.
+    """
+    probe = path.parent
+    try:
+        probe.mkdir(parents=True, exist_ok=True)
+        marker = probe / ".api-key-store-write-test"
+        marker.touch()
+        marker.unlink()
+        return path
+    except OSError as exc:
+        fallback = Path(tempfile.gettempdir()) / path.name
+        log.warning("api_key_store_path_unwritable", extra={
+            "path": str(path), "fallback": str(fallback), "error": str(exc)})
+        return fallback
 
 class ApiKeyStore:
     """SQLite-backed API key metadata and hash store."""
@@ -230,5 +258,5 @@ def get_api_key_store() -> ApiKeyStore:
                 path = Path(configured_path) if configured_path else _DEFAULT_PATH
                 if not path.is_absolute():
                     path = Path(__file__).resolve().parent / path
-                _STORE = ApiKeyStore(path, _legacy_keys_from_env())
+                _STORE = ApiKeyStore(_ensure_writable(path), _legacy_keys_from_env())
     return _STORE

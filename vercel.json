@@ -8,6 +8,7 @@
   "buildCommand": "cd webui-new && npm ci && npm run build",
   "env": {
     "ACCOUNT_STORE_PATH": "/tmp/accounts.json",
+    "API_KEY_STORE_PATH": "/tmp/api_keys.sqlite3",
     "LOG_FORMAT": "json"
   }
 }

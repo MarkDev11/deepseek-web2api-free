@@ -1,8 +1,10 @@
 """Tests for persistent API-key storage, management routes, and client auth."""
 from __future__ import annotations
 
-import sqlite3
 import secrets
+import sqlite3
+import tempfile
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -178,3 +180,48 @@ def test_generated_keys_authenticate_v1_and_revocation_takes_effect(server_clien
     assert client.get(
         "/v1/models", headers={"Authorization": f"Bearer {key}"}
     ).status_code == 503
+
+
+
+class TestStorePathFallback:
+    """`server.py` opens the key store while importing, so an unwritable path
+    cannot be allowed to raise: on a read-only deployment filesystem that single
+    mkdir aborts the import and every route answers 500.
+    """
+
+    def test_unwritable_path_falls_back_to_the_temp_directory(self, monkeypatch, tmp_path):
+        import api_key_store
+
+        blocker = tmp_path / "blocked"
+        blocker.write_text("not a directory", encoding="utf-8")
+        monkeypatch.setattr(api_key_store, "_STORE", None)
+        monkeypatch.setenv(
+            "API_KEY_STORE_PATH", str(blocker / "nested" / "api_keys.sqlite3"))
+
+        store = api_key_store.get_api_key_store()
+
+        assert store.path.parent == Path(tempfile.gettempdir())
+        assert store.list_keys() == []  # usable, just not durable
+
+    def test_writable_path_is_used_as_configured(self, monkeypatch, tmp_path):
+        import api_key_store
+
+        target = tmp_path / "keys" / "api_keys.sqlite3"
+        monkeypatch.setattr(api_key_store, "_STORE", None)
+        monkeypatch.setenv("API_KEY_STORE_PATH", str(target))
+
+        store = api_key_store.get_api_key_store()
+
+        assert store.path == target
+        assert target.exists()
+
+    def test_fallback_creates_the_directory_it_owns(self, monkeypatch, tmp_path):
+        import api_key_store
+
+        target = tmp_path / "deep" / "deeper" / "api_keys.sqlite3"
+        monkeypatch.setattr(api_key_store, "_STORE", None)
+        monkeypatch.setenv("API_KEY_STORE_PATH", str(target))
+
+        store = api_key_store.get_api_key_store()
+
+        assert store.path == target and target.exists()
