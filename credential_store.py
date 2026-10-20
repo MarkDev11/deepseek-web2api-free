@@ -14,7 +14,7 @@ with the instance, so a refreshed token written there disappears on the next
 cold start and the account goes back to its expired credentials.
 
 The stored value is the same JSON document the file backend writes, base64
-encoded so it survives the REST path/body as a single opaque argument.
+encoded so it survives the REST call as a single opaque JSON string.
 """
 from __future__ import annotations
 
@@ -38,9 +38,20 @@ class CredentialStoreError(RuntimeError):
     """Raised when the authoritative store backend cannot be written."""
 
 
+def _first_env(*names: str) -> str:
+    """First non-empty value among the given names. Upstash's own console
+    calls the pair UPSTASH_REDIS_REST_*, Vercel KV called it KV_REST_API_*;
+    both are accepted so either can be pasted as is."""
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _kv_config() -> tuple | None:
-    url = (os.environ.get("KV_REST_API_URL") or "").strip().rstrip("/")
-    token = (os.environ.get("KV_REST_API_TOKEN") or "").strip()
+    url = _first_env("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL").rstrip("/")
+    token = _first_env("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN")
     if not url or not token:
         return None
     return (url, token)
@@ -58,15 +69,17 @@ def backend() -> str:
 def _command(cfg: tuple, args: list) -> object:
     """Run one Upstash-REST command; returns the parsed `result`."""
     url, token = cfg
-    cmd, rest = args[0], args[1:]
-    target = f"{url}/{cmd}"
-    body = ("\n".join(rest) + "\n") if rest else None
+    cmd = args[0]
+    # One JSON array POSTed to the root path. The "arguments separated by
+    # newlines in the body" form that circulates in examples delivers only one
+    # argument in practice: a real database answers SET key value with
+    # "ERR wrong number of arguments", which would fail every write.
     resp = httpx.post(
-        target,
-        content=body.encode("utf-8") if body else b"",
+        f"{url.rstrip('/')}/",
+        json=list(args),
         headers={
             "Authorization": f"Bearer {token}",
-            "Content-Type": "text/plain",
+            "Content-Type": "application/json",
         },
         timeout=_KV_TIMEOUT,
     )
