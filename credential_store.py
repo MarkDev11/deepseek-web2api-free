@@ -164,15 +164,27 @@ def write_store(path: Path, payload: str) -> None:
         raise CredentialStoreError(f"kv write failed: {error}") from error
 
 
+def _quiet_chmod(target: str, mode: int) -> None:
+    """Tighten permissions when the filesystem allows it.
+
+    Serverless filesystems may reject chmod on their temp directory with
+    EPERM ("Operation not permitted", seen on Vercel's /tmp) even for a file
+    the process created itself. Losing the owner-only mode bits is far
+    cheaper than failing the save, so the error is swallowed here instead of
+    being allowed to abort the write.
+    """
+    try:
+        os.chmod(target, mode)
+    except OSError:
+        pass
+
+
 def _write_file(path: Path, payload: str) -> None:
     """Atomic replace (tmp + os.replace) with owner-only permissions."""
     import tempfile
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:  # pragma: no cover - windows / exotic fs
-        pass
+    _quiet_chmod(str(path.parent), 0o700)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True,
     )
@@ -181,9 +193,9 @@ def _write_file(path: Path, payload: str) -> None:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp_name, 0o600)
+        _quiet_chmod(tmp_name, 0o600)
         os.replace(tmp_name, path)
-        os.chmod(path, 0o600)
+        _quiet_chmod(str(path), 0o600)
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)

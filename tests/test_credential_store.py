@@ -218,3 +218,19 @@ class TestUpstashWireFormat:
         monkeypatch.setenv("KV_ACCOUNTS_KEY", "mine:accounts")
         cs.write_store(tmp / "accounts.json", "{}")
         assert "mine:accounts" in fake.data
+
+
+class TestFileMirrorPermissions:
+    """Vercel's /tmp rejects chmod with EPERM; that must not lose accounts."""
+
+    def test_chmod_eperm_does_not_fail_the_save(self, tmp_path, monkeypatch, no_kv):
+        target = str(tmp_path)
+
+        def refusing_chmod(path, mode):
+            if str(path).startswith(target):
+                raise PermissionError(1, "Operation not permitted", str(path))
+
+        monkeypatch.setattr(cs.os, "chmod", refusing_chmod)
+        path = tmp_path / "nested" / "accounts.json"
+        cs.write_store(path, json.dumps({"accounts": []}))
+        assert json.loads(path.read_text(encoding="utf-8")) == {"accounts": []}
