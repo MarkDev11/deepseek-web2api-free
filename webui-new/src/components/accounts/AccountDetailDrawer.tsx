@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { StateBadge } from './StateBadge'
 import { ReloginButton } from './ReloginButton'
+import { RefreshTokenButton } from './RefreshTokenButton'
 import { toast } from '@/hooks/use-toast'
 import { formatUptime, truncateMiddle } from '@/lib/utils'
 import type { Account } from '@/lib/types'
@@ -77,6 +78,37 @@ export function AccountDetailDrawer({ account, onClose, onRelogin }: Props) {
 
               <Separator />
 
+              {(account.token_expires_at || account.token_expires_in != null || account.last_refresh_at || account.last_refresh_status) && (
+                <>
+                  <section>
+                    <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Token refresh</h3>
+                    <DetailRow
+                      label="Expires at"
+                      value={account.token_expires_at ? fmtTs(account.token_expires_at) : '—'}
+                    />
+                    <DetailRow
+                      label="Last refresh"
+                      value={account.last_refresh_at ? fmtTs(account.last_refresh_at) : '—'}
+                    />
+                    <DetailRow
+                      label="Refresh status"
+                      value={
+                        account.last_refresh_status === 'ok'
+                          ? 'OK'
+                          : account.last_refresh_status === 'failed'
+                            ? 'Failed'
+                            : '—'
+                      }
+                    />
+                    {account.last_refresh_status === 'failed' && account.last_refresh_error && (
+                      <DetailRow label="Refresh error" value={account.last_refresh_error} />
+                    )}
+                  </section>
+
+                  <Separator />
+                </>
+              )}
+
               <section>
                 <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Runtime</h3>
                 <DetailRow label="Error count" value={String(account.error_count)} />
@@ -113,6 +145,7 @@ export function AccountDetailDrawer({ account, onClose, onRelogin }: Props) {
               <Separator />
 
               <div className="flex flex-wrap gap-2">
+                <RefreshTokenButton accountId={account.id} onDone={onRelogin} />
                 {account.state === 'error' && (
                   <ReloginButton accountId={account.id} onDone={onRelogin} />
                 )}

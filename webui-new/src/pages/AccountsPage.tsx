@@ -98,6 +98,7 @@ export default function AccountsPage() {
               onEdit={(a) => setEditing(a)}
               onDelete={(a) => setDeleting(a)}
               onSelect={(a) => setViewing(a)}
+              onRefreshed={refresh}
             />
           )}
         </CardContent>

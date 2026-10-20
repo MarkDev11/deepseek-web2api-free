@@ -40,6 +40,16 @@ export interface Account {
   token_preview: string
   cookies_preview: string
   credential_fingerprint: string
+  /** Unix seconds when the account token (JWT) expires; 0 = unknown / not a JWT. */
+  token_expires_at?: number
+  /** Remaining seconds until the token expires; negative = expired; null/absent = unknown. */
+  token_expires_in?: number | null
+  /** Unix seconds of the last token + cookies refresh; 0 = never. */
+  last_refresh_at?: number
+  /** Result of the last refresh attempt: "", "ok" or "failed". */
+  last_refresh_status?: string
+  /** Error message of the last failed refresh attempt. */
+  last_refresh_error?: string
 }
 
 export interface AccountsResponse {
@@ -75,6 +85,13 @@ export interface LoginResponse {
 export interface ReloginResponse {
   ok: boolean
   message: string
+}
+
+/** Response of POST /admin/api/accounts/{id}/refresh (always HTTP 200; ok:false = failed). */
+export interface RefreshResponse {
+  ok: boolean
+  message: string
+  account?: Account
 }
 
 export interface ModelInfo {

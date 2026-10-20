@@ -12,6 +12,8 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { StateBadge } from './StateBadge'
 import { ReloginButton } from './ReloginButton'
+import { RefreshTokenButton } from './RefreshTokenButton'
+import { TokenExpiryBadge } from './TokenExpiryBadge'
 import { truncateMiddle } from '@/lib/utils'
 import type { Account } from '@/lib/types'
 
@@ -20,9 +22,11 @@ interface Props {
   onEdit: (a: Account) => void
   onDelete: (a: Account) => void
   onSelect: (a: Account) => void
+  /** Called after a token refresh attempt so the list can be reloaded. */
+  onRefreshed?: () => void
 }
 
-export function AccountTable({ accounts, onEdit, onDelete, onSelect }: Props) {
+export function AccountTable({ accounts, onEdit, onDelete, onSelect, onRefreshed }: Props) {
   return (
     <Table>
       <TableHeader>
@@ -30,6 +34,7 @@ export function AccountTable({ accounts, onEdit, onDelete, onSelect }: Props) {
           <TableHead>Email</TableHead>
           <TableHead>Source</TableHead>
           <TableHead>Status</TableHead>
+          <TableHead>Token expiry</TableHead>
           <TableHead>Token</TableHead>
           <TableHead>Cookies</TableHead>
           <TableHead className="text-right">Errors</TableHead>
@@ -70,6 +75,9 @@ export function AccountTable({ accounts, onEdit, onDelete, onSelect }: Props) {
                 <StateBadge state={a.state} />
               </TableCell>
               <TableCell>
+                <TokenExpiryBadge expiresIn={a.token_expires_in} />
+              </TableCell>
+              <TableCell>
                 <span className="font-mono text-xs text-muted-foreground">
                   {a.token_preview || '—'}
                 </span>
@@ -108,6 +116,7 @@ export function AccountTable({ accounts, onEdit, onDelete, onSelect }: Props) {
               <TableCell className="text-right">
                 <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
                   {a.state === 'error' && <ReloginButton accountId={a.id} />}
+                  <RefreshTokenButton accountId={a.id} onDone={onRefreshed} />
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
