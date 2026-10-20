@@ -41,6 +41,16 @@ log = get_logger("adapter")
 
 BASE_URL = "https://chat.deepseek.com"
 IMPERSONATE = os.environ.get("DEEPSEEK_IMPERSONATE", "chrome131")
+
+# Client fingerprint defaults, measured from a live browser request on
+# 2026-10-20 (see DeepSeekAdapter._base_headers). The upstream reads these as
+# part of "is this the real web client", and the credentials in the pool belong
+# to one specific browser, so the header set should describe that browser
+# rather than a stale capture. Each value is overridable per deployment.
+CLIENT_VERSION = "2.5.0"
+CLIENT_LOCALE = "en_US"
+CLIENT_TZ_OFFSET = "25200"          # UTC+7
+ACCEPT_LANGUAGE = "en-US,en;q=0.8"
 try:
     JITTER_SECS = max(0.0, float(os.environ.get("DEEPSEEK_JITTER_SECS", "0.4") or 0))
 except ValueError:
@@ -343,13 +353,23 @@ class DeepSeekAdapter:
                     )
 
         self._msg_counters: dict[str, int] = {}
+        version = (os.environ.get("DEEPSEEK_CLIENT_VERSION") or CLIENT_VERSION).strip()
+        client_locale = (os.environ.get("DEEPSEEK_CLIENT_LOCALE") or CLIENT_LOCALE).strip()
+        tz_offset = (os.environ.get("DEEPSEEK_CLIENT_TZ_OFFSET") or CLIENT_TZ_OFFSET).strip()
+        accept_language = (
+            os.environ.get("DEEPSEEK_ACCEPT_LANGUAGE") or ACCEPT_LANGUAGE
+        ).strip()
+        # The real frontend identifies the browser with x-device-id (stored in
+        # localStorage as "deepseek-device-id:chat"). It is per browser, not per
+        # deployment, so it stays unset unless configured.
+        device_id = (os.environ.get("DEEPSEEK_DEVICE_ID") or "").strip()
         # Header set captured from a live browser fetch().
         # Names use the same casing the real browser sends.
         self._base_headers = {
             "User-Agent": self._DEFAULT_UA,
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language": accept_language,
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.token}",
             "Origin": BASE_URL,
@@ -361,15 +381,19 @@ class DeepSeekAdapter:
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
-            # DeepSeek-specific application headers (current as of 2026-08-02).
-            # x-client-version tracks the browser release; X-App-Version is no
-            # longer sent by the real frontend and was dropped.
-            "X-Client-Version": "2.3.0",
+            # DeepSeek-specific application headers (live capture 2026-10-20).
+            # X-App-Version is no longer sent by the real frontend and was
+            # dropped. User-Agent and Sec-Ch-Ua stay pinned to the curl_cffi
+            # impersonation target: they must agree with the TLS fingerprint of
+            # the session, so they are deliberately not taken from this capture.
+            "X-Client-Version": version,
             "X-Client-Platform": "web",
-            "X-Client-Locale": "zh_CN",
-            "X-Client-Timezone-Offset": "28800",
+            "X-Client-Locale": client_locale,
+            "X-Client-Timezone-Offset": tz_offset,
             "x-client-bundle-id": "com.deepseek.chat",
         }
+        if device_id:
+            self._base_headers["X-Device-Id"] = device_id
 
     @staticmethod
     def _normalize_token(token: str) -> str:
