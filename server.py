@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 from adapter import (
     DeepSeekAdapter,
+    UpstreamAuthError,
     UpstreamEmptyError,
     UpstreamHintError,
     RateLimitError,
@@ -423,7 +424,23 @@ class AcquiredAccount:
             self._session_id = self._cached_session.chat_session_id
             self._parent_message_id = self._cached_session.parent_message_id
             return self._session_id
-        ds_id = self.adapter.create_session()
+        try:
+            ds_id = self.adapter.create_session()
+        except UpstreamAuthError:
+            # Credentials expired between requests. Mint new ones and retry
+            # once, so a rollover costs the caller a few hundred milliseconds
+            # instead of a failed request.
+            ok, msg = pool.refresh_account(self.acct)
+            if not ok:
+                raise UpstreamAuthError(
+                    f"credentials rejected and refresh failed: {msg}") from None
+            # The cached conversation belongs to the old credentials, and the
+            # account may still sit in `error` behind the failure just fixed.
+            if self._cache_key:
+                SESSION_CACHE.invalidate(self._cache_key)
+            self._cached_session = None
+            pool.mark_recovered(self.acct)
+            ds_id = self.adapter.create_session()
         self._session_id = ds_id
         if self._cache_key:
             sess = ChatSession(chat_session_id=ds_id, account_id=self.acct.id)
@@ -889,6 +906,18 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         if cache_key:
             SESSION_CACHE.invalidate(cache_key)
         raise HTTPException(status_code=502, detail="上游返回空响应（可能触发限流），请稍后重试")
+    except UpstreamAuthError as e:
+        # create_session() above already tried to refresh and failed, so the
+        # caller needs the reason rather than an opaque 500. mark_error()
+        # recognises the auth signature, records the failure and queues another
+        # refresh attempt under the cooldown - without walking the account into
+        # the health-recovery path, which cannot fix expired credentials.
+        get_stats().record(MODEL_NAME, 0, success=False)
+        if cache_key:
+            SESSION_CACHE.invalidate(cache_key)
+        pool.mark_error(acq.acct, str(e))
+        raise HTTPException(status_code=502,
+                            detail=f"DeepSeek 凭证已失效且刷新失败：{e}")
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
         pool.mark_error(acq.acct, str(e))
@@ -1010,6 +1039,18 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         if cache_key:
             SESSION_CACHE.invalidate(cache_key)
         raise HTTPException(status_code=502, detail="上游返回空响应（可能触发限流），请稍后重试")
+    except UpstreamAuthError as e:
+        # create_session() above already tried to refresh and failed, so the
+        # caller needs the reason rather than an opaque 500. mark_error()
+        # recognises the auth signature, records the failure and queues another
+        # refresh attempt under the cooldown - without walking the account into
+        # the health-recovery path, which cannot fix expired credentials.
+        get_stats().record(MODEL_NAME, 0, success=False)
+        if cache_key:
+            SESSION_CACHE.invalidate(cache_key)
+        pool.mark_error(acq.acct, str(e))
+        raise HTTPException(status_code=502,
+                            detail=f"DeepSeek 凭证已失效且刷新失败：{e}")
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
         pool.mark_error(acq.acct, str(e))

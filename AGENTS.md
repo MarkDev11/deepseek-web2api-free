@@ -4,9 +4,36 @@
 
 ## 当前账号配置规则
 
-- 账号凭证只通过 WebUI 账号池或 `data/accounts.json` 配置；WebUI 的修改会持久化到该 JSON 文件。
+- 账号凭证只通过 WebUI 账号池配置；持久化后端是 `data/accounts.json`，或（配置了 Vercel KV 时）KV 为权威、JSON 文件为镜像，见「凭证刷新与账号存储」。
 - `.env` 中的 `DEEPSEEK_TOKEN`、`DEEPSEEK_COOKIES`、`DEEPSEEK_EMAIL`、`DEEPSEEK_PROXY` 及编号形式不再读取；池空时不会使用环境变量兜底。
 - 以下版本记录保留当时的实现历史；其中曾描述的 `.env` 账号兜底已经移除。
+
+## 凭证刷新与账号存储（本 fork 新增，2026-10-20）
+
+> DeepSeek 网页版的 token 与 cookie 寿命很短，这是本 fork 相对上游唯一的功能性新增。
+
+**三种触发方式**
+
+| 触发 | 位置 | 行为 |
+|------|------|------|
+| 主动 | `AccountPool.acquire()` / `acquire_by_id()` | token 进入 `TOKEN_REFRESH_AHEAD_SECS`（默认 900s）窗口时在**后台线程**刷新；请求本身不等待 |
+| 被动 | `AccountPool.mark_error()` + `AcquiredAccount.create_session()` | 上游拒绝凭证（HTTP 200 + `{"code":40003,"msg":"Authorization Failed (invalid token)"}`，**不是 401**）时刷新；`create_session()` 同步刷新并**重试一次**，让当次请求仍可成功 |
+| 手动 | WebUI「账号池 → Refresh」/ `POST /admin/api/accounts/{id}/refresh` | 同步刷新并把结果写回存储 |
+
+**模块划分**
+
+| 文件 | 职责 |
+|------|------|
+| `credentials.py` | 纯函数：JWT `exp` 解码、`should_refresh()`、`is_auth_failure()`（40003 / 文案标记）、多形态 token 提取、cookie blob 合并；无网络、无全局 |
+| `credential_store.py` | 账号文档存储后端：`KV_REST_API_URL` + `KV_REST_API_TOKEN` 同时存在时 **Vercel KV**（Upstash REST，值 base64 单行）为权威、`ACCOUNT_STORE_PATH` 为镜像/兜底；否则纯文件后端。KV 写失败抛 `CredentialStoreError`，不静默丢凭证 |
+| `adapter.py` | `refresh_credentials()` 依次尝试 `DEEPSEEK_REFRESH_PATHS`，**就地**替换 token（保留 cookie jar 与 PoW solver，不打断在途请求）、`set_token()`/`cookie_blob()`/`token_expires_at`；新增 `UpstreamAuthError`、`CredentialRefreshError` |
+| `account_pool.py` | `Account` 新增 `token_expires_at` / `last_refresh_at` / `last_refresh_status` / `last_refresh_error`（随 `to_store_dict()` 持久化）；`refresh_account()`/`refresh_by_id()`/`_schedule_refresh_locked()`（冷却 `TOKEN_REFRESH_MIN_INTERVAL_SECS` + 并发合并） |
+| `admin.py` | `POST /accounts/{id}/refresh`；`/admin/api/env` 增加 5 条 refresh 变量与 `credential_store` 后端信息 |
+| `webui-new` | 账号表新增「Token expiry」徽章与「Refresh」按钮；账号抽屉新增 Token refresh 区块 |
+
+**已知未证实项**：刷新端点路径无法从服务端证实——chat.deepseek.com 的 SPA bundle 在 AWS WAF 的 JS 挑战之后，服务器端拿不到脚本正文。因此：路径可用 `DEEPSEEK_REFRESH_PATHS` 覆盖；响应解析对 4 种常见包装做了容错；失败原因完整写入 `last_refresh_error`，面板与日志（`credential_refresh_failed`）都能看到。**首次在有凭证的环境上请点一次手动 Refresh 验证**：报 `HTTP 404` 就把浏览器 DevTools 里真实的刷新路径填进 `DEEPSEEK_REFRESH_PATHS`；报 `no token in response` 说明响应结构变化，按实际结构补 `credentials._TOKEN_KEYS`。JWT 的 `exp` 与 40003 判定不依赖该端点，二者已用真实响应样本验证。
+
+**与上游的差异**：上游只把账号写在 `ACCOUNT_STORE_PATH`（Vercel 上是 `/tmp`，冷启动即失效 → 刷新结果会丢失），本 fork 因此引入 KV 后端。加密不变：同一个 `DEEPSEEK_ENCRYPTION_KEY`（Fernet）同样作用于 KV 中的值。
 
 ---
 

@@ -28,6 +28,12 @@ except ImportError as e:
         "Run: pip install -r requirements.txt"
     ) from e
 
+from credentials import (
+    extract_refreshed_token,
+    is_auth_failure,
+    merge_cookie_blobs,
+    token_expires_at as _jwt_expires_at,
+)
 from logger import get_logger
 
 load_dotenv()
@@ -49,6 +55,22 @@ try:
 except ValueError:
     RATE_LIMIT_RETRY_DELAYS = []
 
+# Credential refresh endpoints, tried in order (see refresh_credentials()).
+# The contract is NOT verified against a live account: chat.deepseek.com's SPA
+# is served behind an AWS WAF JS challenge, so its bundle cannot be read
+# server-side to confirm the path. Hence the list is configurable — if the
+# upstream endpoint moves, set DEEPSEEK_REFRESH_PATHS without a code change.
+REFRESH_PATHS = [
+    x.strip() for x in os.environ.get(
+        "DEEPSEEK_REFRESH_PATHS",
+        "/api/v0/auth/refresh,/api/v0/user/refresh_token",
+    ).split(",") if x.strip()
+]
+try:
+    REFRESH_TIMEOUT_SECS = max(1.0, float(os.environ.get("DEEPSEEK_REFRESH_TIMEOUT_SECS", "20") or 20))
+except ValueError:
+    REFRESH_TIMEOUT_SECS = 20.0
+
 _WASM_PATH = Path(__file__).resolve().parent / "sha3_wasm_bg.wasm"
 with open(_WASM_PATH, "rb") as f:
     _WASM_BYTES = f.read()
@@ -69,6 +91,18 @@ class WAFChallengeError(Exception):
         self.kind = kind
         self.status = status
         self.body = body
+
+
+class UpstreamAuthError(RuntimeError):
+    """The upstream rejected the credentials (HTTP 200 + code 40003,
+    "Authorization Failed (invalid token)"). Unlike a rate limit, waiting does
+    not help — the token has to be refreshed, and if that fails the account
+    needs a fresh token/cookies from the browser.
+    """
+
+
+class CredentialRefreshError(RuntimeError):
+    """No configured refresh endpoint yielded a new token."""
 
 
 class UpstreamEmptyError(RuntimeError):
@@ -404,9 +438,13 @@ class DeepSeekAdapter:
         biz = inner.get("biz_data") if isinstance(inner, dict) else None
         challenge = biz.get("challenge") if isinstance(biz, dict) else None
         if not challenge:
+            code, msg = data.get("code"), str(data.get("msg") or "")
+            if is_auth_failure(code, msg):
+                raise UpstreamAuthError(
+                    f"credentials rejected: {code} - {msg}")
             raise RuntimeError(
-                f"challenge rejected: {data.get('code', 'unknown')} - "
-                f"{data.get('msg', 'refresh DEEPSEEK_TOKEN/COOKIES')}"
+                f"challenge rejected: {code if code is not None else 'unknown'} - "
+                f"{msg or 'refresh DEEPSEEK_TOKEN/COOKIES'}"
             )
         return challenge
 
@@ -452,12 +490,108 @@ class DeepSeekAdapter:
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 0:
+            if is_auth_failure(data.get("code"), str(data.get("msg") or "")):
+                raise UpstreamAuthError(f"credentials rejected: {data}")
             raise RuntimeError(f"Session creation failed: {data}")
         biz = data["data"]["biz_data"]
         # Handle both formats: direct id vs nested chat_session.id
         if "id" in biz:
             return biz["id"]
         return biz["chat_session"]["id"]
+
+    # ── Credential refresh ───────────────────────────────────────
+
+    @property
+    def token_expires_at(self) -> int:
+        """Unix expiry from the token's JWT `exp` claim (0 = unknown)."""
+        return _jwt_expires_at(self.token)
+
+    def set_token(self, token: str) -> None:
+        """Swap the bearer token in place (accepts the localStorage form too)."""
+        self.token = self._normalize_token(token)
+        self._base_headers["Authorization"] = f"Bearer {self.token}"
+
+    def cookie_blob(self) -> str:
+        """The live cookie jar as a `name=value; ...` blob.
+
+        The jar is the source of truth after construction (Set-Cookie rotations
+        land there), so exporting it is how a refreshed WAF/session cookie makes
+        it back into the persisted account.
+        """
+        parts = []
+        jar = getattr(self._client, "cookies", None)
+        getter = getattr(jar, "items", None)
+        if callable(getter):
+            try:
+                for name, value in getter():
+                    if name:
+                        parts.append(f"{name}={value if value is not None else ''}")
+            except Exception as e:  # pragma: no cover - jar implementation detail
+                log.debug("cookie_blob_failed", extra={"error": str(e)})
+        return "; ".join(parts)
+
+    def refresh_credentials(self) -> dict:
+        """Mint fresh credentials using the current ones.
+
+        Posts an empty JSON body to each path in REFRESH_PATHS until one returns
+        a token, then swaps token + cookies into this adapter and returns
+        `{token, cookies, path, expires_at, raw}`.
+
+        Two failure modes are deliberately distinguished:
+        * UpstreamAuthError - the current credentials are already dead, and a
+          refresh needs a live token. Only a browser login can recover.
+        * CredentialRefreshError - the endpoint is missing/moved or the payload
+          shape changed; DEEPSEEK_REFRESH_PATHS is the escape hatch.
+        """
+        notes = []
+        for path in REFRESH_PATHS:
+            url = f"{BASE_URL}{path}"
+            try:
+                resp = self._client.post(
+                    url, json={}, headers=self._base_headers,
+                    timeout=REFRESH_TIMEOUT_SECS,
+                )
+            except Exception as e:
+                notes.append(f"{path}: {e}")
+                continue
+
+            kind = self._detect_waf_challenge(resp.status_code, resp.headers)
+            if kind:
+                notes.append(f"{path}: {kind} ({resp.status_code})")
+                continue
+
+            try:
+                payload = resp.json()
+            except Exception:
+                notes.append(f"{path}: HTTP {resp.status_code}, non-JSON body")
+                continue
+
+            code = payload.get("code") if isinstance(payload, dict) else None
+            msg = str(payload.get("msg") or "") if isinstance(payload, dict) else ""
+            token = extract_refreshed_token(payload)
+            if not token:
+                if is_auth_failure(code, msg):
+                    raise UpstreamAuthError(
+                        f"credentials rejected by {path}: {code} - {msg}")
+                notes.append(f"{path}: code={code} msg={msg or 'no token in response'}")
+                continue
+
+            self.set_token(token)
+            cookies = merge_cookie_blobs(self.cookies, self.cookie_blob())
+            self.cookies = cookies
+            expires_at = _jwt_expires_at(token)
+            log.info("credentials_refreshed",
+                     extra={"path": path, "token_expires_at": expires_at})
+            return {
+                "token": token,
+                "cookies": cookies,
+                "path": path,
+                "expires_at": expires_at,
+                "raw": payload,
+            }
+
+        raise CredentialRefreshError(
+            "credential refresh failed: " + (" | ".join(notes) or "no refresh paths configured"))
 
     def _parse_sse(self, text: str):
         """Parse SSE text into a list of events"""

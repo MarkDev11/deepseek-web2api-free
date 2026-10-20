@@ -12,6 +12,7 @@ from collections import deque
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
+import credential_store
 from account_pool import AccountPool
 from crypto import is_enabled as crypto_is_enabled, _resolve_key
 from ip_utils import get_real_client_ip, is_trusted_proxy
@@ -239,6 +240,12 @@ class AccountUpdateRequest(BaseModel):
     email: str | None = None
 
 
+class AccountRefreshResponse(BaseModel):
+    ok: bool
+    message: str
+    account: dict | None = None
+
+
 class AccountReloginResponse(BaseModel):
     ok: bool
     message: str
@@ -440,7 +447,12 @@ async def env_info(request: Request):
             {"name": "STATS_HISTORY_INTERVAL_SECS", "value": _env("STATS_HISTORY_INTERVAL_SECS") or "30", "is_default": _flag("STATS_HISTORY_INTERVAL_SECS") == "default"},
             {"name": "DEEPSEEK_IMPERSONATE", "value": _env("DEEPSEEK_IMPERSONATE") or "chrome131", "is_default": _flag("DEEPSEEK_IMPERSONATE") == "default"},
             {"name": "DEEPSEEK_JITTER_SECS", "value": _env("DEEPSEEK_JITTER_SECS") or "0.0", "is_default": _flag("DEEPSEEK_JITTER_SECS") == "default"},
+            {"name": "TOKEN_REFRESH_ENABLED", "value": _env("TOKEN_REFRESH_ENABLED") or "1", "is_default": _flag("TOKEN_REFRESH_ENABLED") == "default"},
+            {"name": "TOKEN_REFRESH_AHEAD_SECS", "value": _env("TOKEN_REFRESH_AHEAD_SECS") or "900", "is_default": _flag("TOKEN_REFRESH_AHEAD_SECS") == "default"},
+            {"name": "TOKEN_REFRESH_MIN_INTERVAL_SECS", "value": _env("TOKEN_REFRESH_MIN_INTERVAL_SECS") or "300", "is_default": _flag("TOKEN_REFRESH_MIN_INTERVAL_SECS") == "default"},
+            {"name": "DEEPSEEK_REFRESH_PATHS", "value": _env("DEEPSEEK_REFRESH_PATHS") or "/api/v0/auth/refresh,/api/v0/user/refresh_token", "is_default": _flag("DEEPSEEK_REFRESH_PATHS") == "default"},
         ],
+        "credential_store": credential_store.describe(),
     }
 
 
@@ -495,3 +507,18 @@ async def relogin_account(account_id: str, request: Request) -> AccountReloginRe
     pool = get_pool()
     ok, msg = pool.relogin_by_id(account_id)
     return AccountReloginResponse(ok=ok, message=msg)
+
+
+@router.post("/accounts/{account_id}/refresh")
+async def refresh_account(account_id: str, request: Request) -> AccountRefreshResponse:
+    """Mint new token + cookies for one account from its current credentials.
+
+    Unlike /relogin, which only re-tests what is already stored, this calls the
+    upstream refresh endpoint and persists the result - the operation that short
+    credential lifetimes actually require.
+    """
+    _check_auth(request)
+    pool = get_pool()
+    ok, msg = pool.refresh_by_id(account_id)
+    acct = next((a for a in pool.get_all() if a["id"] == account_id), None)
+    return AccountRefreshResponse(ok=ok, message=msg, account=acct)

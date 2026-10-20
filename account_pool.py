@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import secrets
-import tempfile
 import time
 import threading
 from dataclasses import dataclass, field
@@ -17,7 +16,13 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+import credential_store
 from adapter import DeepSeekAdapter
+from credentials import (
+    is_auth_failure,
+    should_refresh,
+    token_expires_at as _jwt_expires_at,
+)
 from crypto import (
     is_enabled as crypto_is_enabled,
     encrypt_account_dict,
@@ -44,6 +49,22 @@ _RECOVER_ERROR_THRESHOLD = 3
 _RECOVER_FLAG_DISABLED = os.environ.get("DISABLE_AUTO_RECOVER", "").lower() in {
     "1", "true", "yes", "on",
 }
+
+# Credential refresh (DeepSeek tokens and their cookies are short-lived).
+#   proactive: when a token is within TOKEN_REFRESH_AHEAD_SECS of its JWT "exp"
+#   reactive:  immediately after the upstream rejects credentials (code 40003)
+# Both run on a background thread so no request waits on the refresh, and both
+# respect TOKEN_REFRESH_MIN_INTERVAL_SECS so a failing endpoint is not spammed.
+TOKEN_REFRESH_ENABLED = os.environ.get(
+    "TOKEN_REFRESH_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+try:
+    TOKEN_REFRESH_AHEAD_SECS = max(0, int(os.environ.get("TOKEN_REFRESH_AHEAD_SECS", "900") or 0))
+except ValueError:
+    TOKEN_REFRESH_AHEAD_SECS = 900
+try:
+    TOKEN_REFRESH_MIN_INTERVAL_SECS = max(0, int(os.environ.get("TOKEN_REFRESH_MIN_INTERVAL_SECS", "300") or 0))
+except ValueError:
+    TOKEN_REFRESH_MIN_INTERVAL_SECS = 300
 
 
 def _now() -> int:
@@ -94,7 +115,18 @@ class Account:
     error_count: int = 0
     last_error: str = ""
     last_used: float = 0.0
+    # Credential lifecycle (see credentials.py / adapter.refresh_credentials()).
+    token_expires_at: int = 0      # from the JWT "exp" claim; 0 = unknown
+    last_refresh_at: int = 0       # last attempt (success or failure)
+    last_refresh_status: str = ""  # "" | "ok" | "failed"
+    last_refresh_error: str = ""
     _adapter: Optional[DeepSeekAdapter] = field(default=None, repr=False)
+    _refreshing: bool = field(default=False, repr=False)
+
+    def sync_token_expiry(self) -> int:
+        """Recompute `token_expires_at` from the current token."""
+        self.token_expires_at = _jwt_expires_at(self.token)
+        return self.token_expires_at
 
     @property
     def adapter(self) -> DeepSeekAdapter:
@@ -124,6 +156,13 @@ class Account:
             "token_preview": _mask_secret(self.token),
             "cookies_preview": _cookie_names(self.cookies),
             "credential_fingerprint": self.fingerprint[:12],
+            "token_expires_at": self.token_expires_at,
+            "token_expires_in": (
+                self.token_expires_at - _now() if self.token_expires_at else None
+            ),
+            "last_refresh_at": self.last_refresh_at,
+            "last_refresh_status": self.last_refresh_status,
+            "last_refresh_error": self.last_refresh_error,
         }
 
     def to_store_dict(self) -> dict:
@@ -134,6 +173,10 @@ class Account:
             "cookies": self.cookies,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "token_expires_at": self.token_expires_at,
+            "last_refresh_at": self.last_refresh_at,
+            "last_refresh_status": self.last_refresh_status,
+            "last_refresh_error": self.last_refresh_error,
         }
 
 
@@ -160,12 +203,19 @@ class AccountPool:
 
     def _load_persisted_accounts(self):
         path = self._store_path
-        if not path.exists():
-            return
+        # Through credential_store so a Vercel KV store is read the same way a
+        # local file is (KV first, file mirror as fallback).
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            raw = credential_store.read_store(path)
         except Exception as e:
             log.warning("failed_to_load_account_store", extra={"path": str(path), "error": str(e)})
+            return
+        if raw is None:
+            return
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            log.warning("failed_to_parse_account_store", extra={"path": str(path), "error": str(e)})
             return
 
         version = detect_store_version(data)
@@ -174,7 +224,8 @@ class AccountPool:
             return
 
         # If we're encrypted, rewrite the file as v2 in place (one-shot migration).
-        if version == STORE_VERSION_PLAIN and crypto_is_enabled():
+        if (version == STORE_VERSION_PLAIN and crypto_is_enabled()
+                and credential_store.backend() == "file" and path.exists()):
             try:
                 maybe_upgrade_store_file(path)
                 log.info("upgraded_account_store_to_encrypted", extra={"path": str(path)})
@@ -191,7 +242,7 @@ class AccountPool:
                 continue
             created_at = int(item.get("created_at") or _now())
             updated_at = int(item.get("updated_at") or created_at)
-            self._append_loaded(Account(
+            acct = Account(
                 id=str(item.get("id") or _account_id()),
                 email=str(item.get("email") or ""),
                 token=token,
@@ -199,7 +250,15 @@ class AccountPool:
                 source="file",
                 created_at=created_at,
                 updated_at=updated_at,
-            ))
+                token_expires_at=int(item.get("token_expires_at") or 0),
+                last_refresh_at=int(item.get("last_refresh_at") or 0),
+                last_refresh_status=str(item.get("last_refresh_status") or ""),
+                last_refresh_error=str(item.get("last_refresh_error") or ""),
+            )
+            # The live token wins over a stored expiry: credentials may have
+            # been edited by hand in the store.
+            acct.token_expires_at = _jwt_expires_at(token) or acct.token_expires_at
+            self._append_loaded(acct)
 
     def _ensure_store_dir(self):
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,24 +279,8 @@ class AccountPool:
                 "accounts": [a.to_store_dict() for a in self._accounts],
             }
         payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{self._store_path.name}.",
-            suffix=".tmp",
-            dir=str(self._store_path.parent),
-            text=True,
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            os.chmod(tmp_name, 0o600)
-            os.replace(tmp_name, self._store_path)
-            os.chmod(self._store_path, 0o600)
-        finally:
-            if os.path.exists(tmp_name):
-                os.unlink(tmp_name)
+        # KV is authoritative when configured; the file is written as a mirror.
+        credential_store.write_store(self._store_path, payload)
 
     # ── CRUD ───────────────────────────────────────────────────
 
@@ -264,6 +307,7 @@ class AccountPool:
                 created_at=now,
                 updated_at=now,
             )
+            acct.sync_token_expiry()
             self._accounts.append(acct)
             self._save_persisted_accounts_locked()
             return acct
@@ -291,6 +335,11 @@ class AccountPool:
             credentials_changed = new_token != acct.token or new_cookies != acct.cookies
             acct.token = new_token
             acct.cookies = new_cookies
+            if credentials_changed:
+                # A manual edit supersedes the previous refresh state.
+                acct.sync_token_expiry()
+                acct.last_refresh_status = ""
+                acct.last_refresh_error = ""
             acct.email = new_email or acct.email
             acct.updated_at = _now()
             if credentials_changed:
@@ -347,6 +396,9 @@ class AccountPool:
                 if acct.state == "idle":
                     acct.state = "busy"
                     acct.last_used = time.time()
+                    # Proactive refresh: pick the moment we are already touching
+                    # this account, so the next caller finds fresh credentials.
+                    self._schedule_refresh_locked(acct)
                     return acct
             return None
 
@@ -365,6 +417,7 @@ class AccountPool:
                 if acct.id == account_id and acct.state == "idle":
                     acct.state = "busy"
                     acct.last_used = time.time()
+                    self._schedule_refresh_locked(acct)
                     return acct
             return None
 
@@ -385,6 +438,16 @@ class AccountPool:
             acct.error_count += 1
             acct.last_error = error_msg
             should_recover = acct.error_count >= _RECOVER_ERROR_THRESHOLD
+            # A rejected token never heals by waiting, so on an auth failure we
+            # refresh the credentials instead of scheduling a health check.
+            auth_failure = is_auth_failure(None, error_msg)
+            if auth_failure:
+                self._schedule_refresh_locked(acct, force=True)
+
+        if auth_failure:
+            log.info("credential_refresh_requested",
+                     extra={"id": acct.id, "reason": "auth_failure"})
+            return
 
         if should_recover and not _RECOVER_FLAG_DISABLED:
             # Run the health check on a background thread so the request
@@ -417,6 +480,107 @@ class AccountPool:
             acct.error_count = 0
             acct.last_error = ""
             acct._adapter = None
+
+    # ── Credential refresh ─────────────────────────────────────
+
+    def _schedule_refresh_locked(self, acct: Account, force: bool = False) -> bool:
+        """Start a background credential refresh when one is due. Caller must
+        hold `self._lock`. Returns True when a worker was started.
+
+        Never blocks: this runs on the request path (account selection) and on
+        error reporting, where waiting for a network round trip is the wrong
+        trade. The cooldown keeps a moved/broken refresh endpoint from being
+        hammered once per request.
+        """
+        if not TOKEN_REFRESH_ENABLED or acct._refreshing:
+            return False
+        now = _now()
+        if (acct.last_refresh_at and TOKEN_REFRESH_MIN_INTERVAL_SECS
+                and now - acct.last_refresh_at < TOKEN_REFRESH_MIN_INTERVAL_SECS):
+            return False
+        if not force and not should_refresh(acct.token_expires_at, TOKEN_REFRESH_AHEAD_SECS, now):
+            return False
+        acct._refreshing = True
+        threading.Thread(
+            target=self._refresh_worker, args=(acct, "proactive" if not force else "reactive"),
+            daemon=True,
+        ).start()
+        return True
+
+    def _refresh_worker(self, acct: Account, reason: str) -> None:
+        try:
+            ok, msg = self._do_refresh(acct, reason)
+            log.info(
+                "credential_refresh_finished",
+                extra={"id": acct.id, "reason": reason, "ok": ok, "error": "" if ok else msg},
+            )
+        except Exception as e:  # noqa: BLE001 - never kill the thread silently
+            with self._lock:
+                acct._refreshing = False
+            log.warning("credential_refresh_crashed", extra={"id": acct.id, "error": str(e)})
+
+    def _do_refresh(self, acct: Account, reason: str) -> tuple[bool, str]:
+        """Perform the refresh for an account already claimed by `_refreshing`."""
+        try:
+            info = acct.adapter.refresh_credentials()
+        except Exception as e:  # includes UpstreamAuthError / CredentialRefreshError
+            with self._lock:
+                acct.last_refresh_at = _now()
+                acct.last_refresh_status = "failed"
+                acct.last_refresh_error = str(e)
+                acct._refreshing = False
+            log.warning("credential_refresh_failed",
+                        extra={"id": acct.id, "reason": reason, "error": str(e)})
+            return False, str(e)
+
+        with self._lock:
+            # Keep the existing adapter: refresh_credentials() swapped the new
+            # bearer token into it, so the warm cookie jar and PoW solver stay
+            # useful and in-flight requests are not disturbed.
+            acct.token = info["token"]
+            acct.cookies = info["cookies"]
+            acct.token_expires_at = int(info.get("expires_at") or 0)
+            acct.last_refresh_at = _now()
+            acct.last_refresh_status = "ok"
+            acct.last_refresh_error = ""
+            acct.updated_at = _now()
+            if acct.state == "error":
+                acct.state = "idle"
+            acct.error_count = 0
+            acct.last_error = ""
+            persist_error = ""
+            try:
+                self._save_persisted_accounts_locked()
+            except Exception as e:  # noqa: BLE001 - refreshed in memory regardless
+                persist_error = str(e)
+                log.error("credential_refresh_not_persisted",
+                          extra={"id": acct.id, "error": persist_error,
+                                 "backend": credential_store.backend()})
+            acct._refreshing = False
+
+        log.info("credential_refreshed",
+                 extra={"id": acct.id, "reason": reason, "path": info.get("path"),
+                        "token_expires_at": acct.token_expires_at})
+        msg = f"credentials refreshed via {info.get('path')}"
+        if persist_error:
+            msg += f" (warning: not persisted: {persist_error})"
+        return True, msg
+
+    def refresh_account(self, acct: Account) -> tuple[bool, str]:
+        """Refresh one account now (synchronous). Concurrent calls collapse."""
+        with self._lock:
+            if acct._refreshing:
+                return False, "credential refresh already in progress"
+            acct._refreshing = True
+        return self._do_refresh(acct, "manual")
+
+    def refresh_by_id(self, account_id: str) -> tuple[bool, str]:
+        """Manual entry point (admin API / panel button)."""
+        with self._lock:
+            acct = next((a for a in self._accounts if a.id == account_id), None)
+        if acct is None:
+            return False, "Account not found"
+        return self.refresh_account(acct)
 
     # ── Health check / relogin ─────────────────────────────────
 
