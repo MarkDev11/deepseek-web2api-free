@@ -104,12 +104,12 @@ export function EnvPreview() {
           />
           <Row
             k="Credential encryption"
-            v={info.crypto.enabled ? `Fernet (${info.crypto.fernet_configured ? 'key configured' : 'key missing'})` : 'Plaintext'}
-            warn={!info.crypto.enabled}
+            v={info.crypto?.enabled ? `Fernet (${info.crypto.fernet_configured ? 'key configured' : 'key missing'})` : 'Plaintext'}
+            warn={!info.crypto?.enabled}
           />
           <Row
             k="CORS allowed origins"
-            v={info.cors.origins.length === 0 ? 'Same-origin (default)' : info.cors.origins.join(', ')}
+            v={(info.cors?.origins ?? []).length === 0 ? 'Same-origin (default)' : (info.cors?.origins ?? []).join(', ')}
           />
           <Row
             k="Allow credentials"
@@ -117,7 +117,7 @@ export function EnvPreview() {
           />
           <Row
             k="TRUSTED_PROXIES"
-            v={info.trusted_proxies.length === 0 ? 'Not configured (XFF untrusted)' : info.trusted_proxies.join(', ')}
+            v={(info.trusted_proxies ?? []).length === 0 ? 'Not configured (XFF untrusted)' : (info.trusted_proxies ?? []).join(', ')}
           />
         </CardContent>
       </Card>

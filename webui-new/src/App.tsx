@@ -1,5 +1,6 @@
 import { Navigate, createBrowserRouter, RouterProvider, Outlet, useLocation } from 'react-router-dom'
 import { AppShell } from '@/components/layout/AppShell'
+import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { useAuthStore } from '@/stores/auth'
 import LoginPage from '@/pages/LoginPage'
 import DashboardPage from '@/pages/DashboardPage'
@@ -18,6 +19,19 @@ function RequireAuth() {
   return <Outlet />
 }
 
+/**
+ * Keeps AppShell (nav + sidebar) mounted when a page throws, and resets the
+ * boundary on navigation so a broken screen does not stick.
+ */
+function PageBoundary() {
+  const location = useLocation()
+  return (
+    <ErrorBoundary key={location.pathname} context={location.pathname}>
+      <Outlet />
+    </ErrorBoundary>
+  )
+}
+
 // basename: '/webui' — the SPA is served under /webui/* by the backend,
 // so client-side navigation keeps the prefix and deep links refresh cleanly.
 const router = createBrowserRouter([
@@ -28,12 +42,17 @@ const router = createBrowserRouter([
       {
         element: <AppShell />,
         children: [
-          { index: true, element: <DashboardPage /> },
-          { path: 'accounts', element: <AccountsPage /> },
-          { path: 'accounts/:id', element: <AccountsPage /> },
-          { path: 'playground', element: <PlaygroundPage /> },
-          { path: 'settings', element: <SettingsPage /> },
-          { path: '*', element: <NotFoundPage /> },
+          {
+            element: <PageBoundary />,
+            children: [
+              { index: true, element: <DashboardPage /> },
+              { path: 'accounts', element: <AccountsPage /> },
+              { path: 'accounts/:id', element: <AccountsPage /> },
+              { path: 'playground', element: <PlaygroundPage /> },
+              { path: 'settings', element: <SettingsPage /> },
+              { path: '*', element: <NotFoundPage /> },
+            ],
+          },
         ],
       },
     ],

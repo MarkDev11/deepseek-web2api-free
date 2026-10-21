@@ -157,7 +157,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Per-model breakdown */}
-      {stats.data && Object.keys(stats.data.models).length > 0 && (
+      {stats.data?.models && Object.keys(stats.data.models).length > 0 && (
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-base flex items-center gap-2">

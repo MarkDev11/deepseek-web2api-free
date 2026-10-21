@@ -1355,23 +1355,39 @@ def _webui_index_path() -> str | None:
     return index if _os.path.isfile(index) else None
 
 
+# Every deploy renames the hashed bundles, so the SPA shell must never be
+# cached: a browser holding an old index.html asks for assets that no longer
+# exist and the panel renders as a blank white page until a hard refresh.
+_SPA_SHELL_CACHE = {"Cache-Control": "no-store, max-age=0, must-revalidate"}
+# Vite output filenames embed a content hash -> safe to cache forever.
+_HASHED_ASSET_CACHE = {"Cache-Control": "public, max-age=31536000, immutable"}
+_OTHER_STATIC_CACHE = {"Cache-Control": "public, max-age=300"}
+
+
+def _webui_cache_headers(rel_path: str) -> "dict[str, str]":
+    normalized = rel_path.replace("\\", "/")
+    if normalized.startswith("assets/") and "." in normalized:
+        return _HASHED_ASSET_CACHE
+    return _OTHER_STATIC_CACHE
+
+
 if _os.path.isdir(_WEBUI_DIR) or True:  # always register so /webui is in the OpenAPI schema
     @app.get("/webui/{rest_of_path:path}")
     async def webui_spa(rest_of_path: str):
         safe = _safe_webui_path(rest_of_path)
         if safe is not None:
-            return FileResponse(safe)
+            return FileResponse(safe, headers=_webui_cache_headers(rest_of_path))
         # SPA fallback: serve index.html so react-router-dom can take over.
         index = _webui_index_path()
         if index is not None:
-            return FileResponse(index)
+            return FileResponse(index, headers=_SPA_SHELL_CACHE)
         return {"error": "webui not built — run `npm run build` in webui-new/"}
 
     @app.get("/webui")
     async def webui_root():
         index = _webui_index_path()
         if index is not None:
-            return FileResponse(index)
+            return FileResponse(index, headers=_SPA_SHELL_CACHE)
         return {"error": "webui not built — run `npm run build` in webui-new/"}
 
 if __name__ == "__main__":
