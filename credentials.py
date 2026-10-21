@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 
 # Upstream business codes / message markers that mean "these credentials are
@@ -203,3 +204,68 @@ def merge_cookie_blobs(old: str, new: str) -> str:
     merged = parse(old)
     merged.update(parse(new))
     return "; ".join(f"{k}={v}" for k, v in merged.items())
+
+
+_COOKIE_PREFIX_RE = re.compile(r"^\s*cookie\s*:\s*", re.IGNORECASE)
+
+
+def _strip_cookie_prefix(value: str) -> str:
+    text = _COOKIE_PREFIX_RE.sub("", (value or "").strip())
+    return text.strip().rstrip(";").strip()
+
+
+def _looks_like_cookie_header(value: str) -> bool:
+    text = (value or "").strip()
+    if not text or "=" not in text:
+        return False
+    if _COOKIE_PREFIX_RE.match(text):
+        return True
+    return ";" in text
+
+
+def parse_credential_blob(raw: str, current_token: str = "",
+                          current_cookies: str = "") -> tuple[str, str]:
+    """Turn one pasted blob into (token, cookies).
+
+    A pasted blob may be a bare token, a localStorage wrapper
+    ({"value": ...}), a raw "Cookie:" header, or any combination joined with
+    "||" or newlines. Whatever is absent falls back to what the account already
+    has, and a cookie header is merged name-by-name so a still-valid
+    ds_session_id (HttpOnly, invisible to document.cookie) survives a partial
+    paste.
+
+    Returns the inputs untouched when the blob yields nothing recognisable, so
+    a bad paste can never blank out working credentials.
+    """
+    text = (raw or "").strip().strip("'\"").strip()
+    if not text:
+        return current_token, current_cookies
+
+    token = ""
+    cookies = ""
+    for chunk in re.split(r"\|\||\n", text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if chunk.startswith("{") or chunk.startswith("["):
+            try:
+                found = extract_refreshed_token(json.loads(chunk))
+            except ValueError:
+                found = ""
+            if found:
+                token = found
+            continue
+        if _looks_like_cookie_header(chunk):
+            cookies = _strip_cookie_prefix(chunk)
+            continue
+        candidate = _strip_bearer(chunk)
+        if _looks_like_token(candidate):
+            token = candidate
+
+    final_token = token or current_token
+    if cookies:
+        final_cookies = merge_cookie_blobs(current_cookies, cookies)
+    else:
+        final_cookies = current_cookies
+    return final_token, final_cookies
+

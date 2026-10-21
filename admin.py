@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 import credential_store
 import account_pool as account_pool
+from credentials import parse_credential_blob
 from account_pool import AccountPool
 from crypto import is_enabled as crypto_is_enabled, _resolve_key
 from ip_utils import get_real_client_ip, is_trusted_proxy
@@ -237,7 +238,7 @@ _stats = StatsSnapshot()
 _pool = AccountPool()
 
 # Kept in sync with server.app.version by tests/test_admin_env.py.
-SERVER_VERSION = "3.3.11"
+SERVER_VERSION = "3.3.12"
 
 
 def get_pool() -> AccountPool:
@@ -259,15 +260,18 @@ class LoginResponse(BaseModel):
 
 
 class AccountAddRequest(BaseModel):
-    token: str
-    cookies: str
+    token: str = ""
+    cookies: str = ""
     email: str | None = ""
+    # One-paste import: a token, a Cookie header, or both joined with "||"/newlines.
+    raw: str | None = None
 
 
 class AccountUpdateRequest(BaseModel):
     token: str | None = None
     cookies: str | None = None
     email: str | None = None
+    raw: str | None = None
 
 
 class AccountRefreshResponse(BaseModel):
@@ -512,8 +516,11 @@ async def list_accounts(request: Request):
 async def add_account(req: AccountAddRequest, request: Request):
     _check_auth(request)
     pool = get_pool()
+    token, cookies = req.token, req.cookies
+    if req.raw and req.raw.strip():
+        token, cookies = parse_credential_blob(req.raw, token, cookies)
     try:
-        acct = pool.add(token=req.token, cookies=req.cookies, email=req.email or "")
+        acct = pool.add(token=token, cookies=cookies, email=req.email or "")
     except Exception as e:
         _pool_error(e)
     return {"ok": True, "account": acct.to_dict()}
@@ -523,8 +530,14 @@ async def add_account(req: AccountAddRequest, request: Request):
 async def update_account(account_id: str, req: AccountUpdateRequest, request: Request):
     _check_auth(request)
     pool = get_pool()
+    token, cookies = req.token, req.cookies
+    if req.raw and req.raw.strip():
+        existing = pool.get_by_id(account_id)
+        cur_token = existing.token if existing else ""
+        cur_cookies = existing.cookies if existing else ""
+        token, cookies = parse_credential_blob(req.raw, cur_token, cur_cookies)
     try:
-        acct = pool.update(account_id, token=req.token, cookies=req.cookies, email=req.email)
+        acct = pool.update(account_id, token=token, cookies=cookies, email=req.email)
     except Exception as e:
         _pool_error(e)
     return {"ok": True, "account": acct.to_dict()}
