@@ -1364,6 +1364,18 @@ _HASHED_ASSET_CACHE = {"Cache-Control": "public, max-age=31536000, immutable"}
 _OTHER_STATIC_CACHE = {"Cache-Control": "public, max-age=300"}
 
 
+def _looks_like_asset(rel_path: str) -> bool:
+    """True for requests that expect a file (assets/x.js, favicon.svg).
+
+    Ordinary SPA routes ("accounts", "settings") have no extension and must
+    fall back to index.html; a *missing bundle* must not.
+    """
+    normalized = rel_path.replace("\\", "/").rstrip("/")
+    if normalized.startswith("assets/"):
+        return True
+    return "." in normalized.rsplit("/", 1)[-1]
+
+
 def _webui_cache_headers(rel_path: str) -> "dict[str, str]":
     normalized = rel_path.replace("\\", "/")
     if normalized.startswith("assets/") and "." in normalized:
@@ -1377,6 +1389,14 @@ if _os.path.isdir(_WEBUI_DIR) or True:  # always register so /webui is in the Op
         safe = _safe_webui_path(rest_of_path)
         if safe is not None:
             return FileResponse(safe, headers=_webui_cache_headers(rest_of_path))
+        # A delta between the cached shell and a fresh deploy asks for bundles
+        # that no longer exist. Answering those with index.html (HTTP 200 +
+        # text/html) makes the browser parse HTML as JavaScript, abort the
+        # whole module graph and paint a blank white page with no visible
+        # error. Answer 404 so a hard refresh is the obvious fix.
+        if _looks_like_asset(rest_of_path):
+            log.warning("webui_asset_missing", extra={"path": rest_of_path})
+            return JSONResponse({"detail": "Not found"}, status_code=404)
         # SPA fallback: serve index.html so react-router-dom can take over.
         index = _webui_index_path()
         if index is not None:

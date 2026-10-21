@@ -49,3 +49,20 @@ def test_other_static_files_use_a_short_cache(client):
     r = client.get("/webui/favicon.svg")
     assert r.status_code == 200
     assert r.headers["cache-control"] == "public, max-age=300"
+
+
+def test_missing_bundle_is_404_not_html(client):
+    """Regression: the SPA fallback used to answer missing bundles with HTML.
+
+    A browser holding a shell from an older deploy then ran HTML as JS, the
+    module graph aborted, and the panel rendered as a blank white page.
+    """
+    r = client.get("/webui/assets/index-stale0hash.js")
+    assert r.status_code == 404
+    assert not r.headers["content-type"].startswith("text/html")
+
+
+def test_unknown_route_still_falls_back_to_shell(client):
+    r = client.get("/webui/accounts/some-deep-link")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
