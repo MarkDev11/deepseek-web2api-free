@@ -885,6 +885,12 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
                                   full_prompt=prompt)
         get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
     except RateLimitError as e:
+        if isinstance(e, UserMutedError):
+            # A mute is enforced server-side until mute_until: retrying this
+            # account does not clear it, it only deepens the penalty. Park it in
+            # the pool (429 still goes to the client) and let the rotation use
+            # the remaining accounts, or fail over to a fresh session.
+            pool.mark_muted(acq.acct, getattr(e, "mute_until", None), str(e))
         # Match the OpenAI endpoint: upstream throttling is a client-visible
         # 429, not an opaque Anthropic 500. This includes account mute errors
         # because UserMutedError derives from RateLimitError.
@@ -1020,6 +1026,12 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
                            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
     except RateLimitError as e:
+        if isinstance(e, UserMutedError):
+            # A mute is enforced server-side until mute_until: retrying this
+            # account does not clear it, it only deepens the penalty. Park it in
+            # the pool (429 still goes to the client) and let the rotation use
+            # the remaining accounts, or fail over to a fresh session.
+            pool.mark_muted(acq.acct, getattr(e, "mute_until", None), str(e))
         # Rate limiting is a transient upstream state, not a credential
         # problem — do NOT mark the account as errored, or the pool would
         # drain to 503 once the limiter cools down. Invalidate the cached

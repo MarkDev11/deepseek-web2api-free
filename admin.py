@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 import credential_store
+import account_pool as account_pool
 from account_pool import AccountPool
 from crypto import is_enabled as crypto_is_enabled, _resolve_key
 from ip_utils import get_real_client_ip, is_trusted_proxy
@@ -476,6 +477,9 @@ async def env_info(request: Request):
             {"name": "DEEPSEEK_CLIENT_BUNDLE_ID", "value": _env("DEEPSEEK_CLIENT_BUNDLE_ID") or _client_fingerprint()["bundle_id"], "is_default": _flag("DEEPSEEK_CLIENT_BUNDLE_ID") == "default"},
             {"name": "DEEPSEEK_CLIENT_PLATFORM", "value": _env("DEEPSEEK_CLIENT_PLATFORM") or _client_fingerprint()["platform"], "is_default": _flag("DEEPSEEK_CLIENT_PLATFORM") == "default"},
             {"name": "DEEPSEEK_JITTER_SECS", "value": _env("DEEPSEEK_JITTER_SECS") or "0.0", "is_default": _flag("DEEPSEEK_JITTER_SECS") == "default"},
+            {"name": "ACCOUNT_COOLDOWN_SECS", "value": _env("ACCOUNT_COOLDOWN_SECS") or ("%g" % account_pool.ACCOUNT_COOLDOWN_SECS), "is_default": _flag("ACCOUNT_COOLDOWN_SECS") == "default"},
+            {"name": "ACCOUNT_COOLDOWN_MAX_WAIT_SECS", "value": _env("ACCOUNT_COOLDOWN_MAX_WAIT_SECS") or ("%g" % account_pool.ACCOUNT_COOLDOWN_MAX_WAIT_SECS), "is_default": _flag("ACCOUNT_COOLDOWN_MAX_WAIT_SECS") == "default"},
+            {"name": "ACCOUNT_MUTE_MIN_SECS", "value": _env("ACCOUNT_MUTE_MIN_SECS") or ("%g" % account_pool.ACCOUNT_MUTE_MIN_SECS), "is_default": _flag("ACCOUNT_MUTE_MIN_SECS") == "default"},
             {"name": "TOKEN_REFRESH_ENABLED", "value": _env("TOKEN_REFRESH_ENABLED") or "1", "is_default": _flag("TOKEN_REFRESH_ENABLED") == "default"},
             {"name": "TOKEN_REFRESH_AHEAD_SECS", "value": _env("TOKEN_REFRESH_AHEAD_SECS") or "900", "is_default": _flag("TOKEN_REFRESH_AHEAD_SECS") == "default"},
             {"name": "TOKEN_REFRESH_MIN_INTERVAL_SECS", "value": _env("TOKEN_REFRESH_MIN_INTERVAL_SECS") or "300", "is_default": _flag("TOKEN_REFRESH_MIN_INTERVAL_SECS") == "default"},

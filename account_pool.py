@@ -51,6 +51,27 @@ _RECOVER_FLAG_DISABLED = os.environ.get("DISABLE_AUTO_RECOVER", "").lower() in {
     "1", "true", "yes", "on",
 }
 
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+# Per-account pacing (anti-mute). DeepSeek punishes bursts from one account, not
+# sustained throughput, so the useful dial is the minimum gap between two
+# upstream turns from the SAME account: extra requests queue instead of stacking
+# up on one account while the others sit idle. 0 disables pacing (default, which
+# keeps the single-account behaviour unchanged).
+ACCOUNT_COOLDOWN_SECS = _env_seconds("ACCOUNT_COOLDOWN_SECS", 0.0)
+# How long acquire() may wait for a cooling account to free up, so a pacing
+# misconfiguration can never pin a request thread indefinitely.
+ACCOUNT_COOLDOWN_MAX_WAIT_SECS = _env_seconds("ACCOUNT_COOLDOWN_MAX_WAIT_SECS", 20.0)
+# Floor for a mute the upstream did not timestamp: the account stays out of
+# rotation at least this long instead of being retried on the next request.
+ACCOUNT_MUTE_MIN_SECS = _env_seconds("ACCOUNT_MUTE_MIN_SECS", 300.0)
+
 # Credential refresh (DeepSeek tokens and their cookies are short-lived).
 #   proactive: when a token is within TOKEN_REFRESH_AHEAD_SECS of its JWT "exp"
 #   reactive:  immediately after the upstream rejects credentials (code 40003)
@@ -116,6 +137,11 @@ class Account:
     error_count: int = 0
     last_error: str = ""
     last_used: float = 0.0
+    # Upstream mute expiry (epoch seconds). DeepSeek answers a muted account with
+    # HTTP 200 + {"biz_code": 5, "biz_msg": "user is muted"}; retrying it does
+    # not shorten the penalty, it only escalates it, so the account sits out
+    # until this timestamp.
+    muted_until: int = 0
     # Credential lifecycle (see credentials.py / adapter.refresh_credentials()).
     token_expires_at: int = 0      # from the JWT "exp" claim; 0 = unknown
     last_refresh_at: int = 0       # last attempt (success or failure)
@@ -152,6 +178,8 @@ class Account:
             "error_count": self.error_count,
             "last_error": self.last_error,
             "last_used": int(self.last_used),
+            "muted_until": self.muted_until,
+            "muted_seconds_remaining": max(0, self.muted_until - _now()),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "token_preview": _mask_secret(self.token),
@@ -178,6 +206,7 @@ class Account:
             "last_refresh_at": self.last_refresh_at,
             "last_refresh_status": self.last_refresh_status,
             "last_refresh_error": self.last_refresh_error,
+            "muted_until": self.muted_until,
         }
 
 
@@ -255,6 +284,7 @@ class AccountPool:
                 last_refresh_at=int(item.get("last_refresh_at") or 0),
                 last_refresh_status=str(item.get("last_refresh_status") or ""),
                 last_refresh_error=str(item.get("last_refresh_error") or ""),
+                muted_until=int(item.get("muted_until") or 0),
             )
             # The live token wins over a stored expiry: credentials may have
             # been edited by hand in the store.
@@ -357,6 +387,9 @@ class AccountPool:
                 acct.state = "idle"
                 acct.error_count = 0
                 acct.last_error = ""
+                # New credentials = new account as far as upstream enforcement
+                # is concerned, so a previous mute no longer applies.
+                acct.muted_until = 0
             self._save_persisted_accounts_locked()
             return acct
 
@@ -390,28 +423,61 @@ class AccountPool:
 
     # ── Selection ──────────────────────────────────────────────
 
-    def acquire(self) -> Optional[Account]:
-        """Get the next idle account (round-robin), or None if all busy.
+    def _ready_at_locked(self, acct: Account, now: float) -> float:
+        """Epoch time from which this IDLE account may take new work (0 = now)."""
+        if acct.state != "idle":
+            return float("inf")
+        if acct.muted_until:
+            return float(acct.muted_until)
+        if ACCOUNT_COOLDOWN_SECS and acct.last_used:
+            return acct.last_used + ACCOUNT_COOLDOWN_SECS
+        return 0.0
 
-        Returns None when no configured account is idle.
+    def acquire(self, wait_timeout: float = -1) -> Optional[Account]:
+        """Get the next idle account (round-robin), or None if none is ready.
+
+        Ready means idle, not muted (muted_until already passed) and - when
+        ACCOUNT_COOLDOWN_SECS is set - not used more recently than that gap.
+        While some accounts are cooling, the call waits for the soonest slot up
+        to wait_timeout (default ACCOUNT_COOLDOWN_MAX_WAIT_SECS) instead of
+        failing the request instantly; all-busy still returns None at once, as
+        before. With pacing off and no mutes this is the plain round-robin of
+        the original implementation.
         """
-        with self._lock:
-            if not self._accounts:
-                return None
-            n = len(self._accounts)
-            for _ in range(n):
-                idx = self._next_idx % n
-                self._next_idx += 1
-                acct = self._accounts[idx]
-                if acct.state == "idle":
-                    acct.state = "busy"
-                    acct.last_used = time.time()
+        if wait_timeout is None:
+            wait_timeout = -1
+        deadline = time.time() + (
+            ACCOUNT_COOLDOWN_MAX_WAIT_SECS if wait_timeout < 0 else wait_timeout
+        )
+        while True:
+            soonest = None
+            with self._lock:
+                if not self._accounts:
+                    return None
+                now = time.time()
+                n = len(self._accounts)
+                for _ in range(n):
+                    idx = self._next_idx % n
+                    self._next_idx += 1
+                    acct = self._accounts[idx]
+                    if now < self._ready_at_locked(acct, now):
+                        continue
                     # Proactive refresh: pick the moment we are already touching
                     # this account, so the next caller finds fresh credentials.
+                    acct.state = "busy"
+                    acct.last_used = time.time()
                     self._schedule_refresh_locked(acct)
                     return acct
-            return None
-
+                for other in self._accounts:
+                    if other.state != "idle":
+                        continue
+                    ready_at = self._ready_at_locked(other, now)
+                    if ready_at and (soonest is None or ready_at < soonest):
+                        soonest = ready_at
+            if soonest is None or time.time() >= deadline:
+                # Every account busy (nothing cooling) -> fail fast, as before.
+                return None
+            time.sleep(min(0.25, max(0.01, soonest - time.time())))
     def acquire_by_id(self, account_id: str) -> Optional[Account]:
         """Acquire one specific idle account.
 
@@ -423,14 +489,19 @@ class AccountPool:
             return None
         with self._lock:
             candidates = self._accounts
+            now = time.time()
             for acct in candidates:
                 if acct.id == account_id and acct.state == "idle":
+                    if now < self._ready_at_locked(acct, now):
+                        # The account we would like to continue on is muted or
+                        # still cooling: start a fresh session elsewhere rather
+                        # than re-entering an already-penalised account.
+                        return None
                     acct.state = "busy"
                     acct.last_used = time.time()
                     self._schedule_refresh_locked(acct)
                     return acct
             return None
-
     def release(self, acct: Account):
         """Mark account back to idle unless it was already marked as error."""
         with self._lock:
@@ -469,6 +540,31 @@ class AccountPool:
                 daemon=True,
             )
             t.start()
+
+    def mark_muted(self, acct: Account, mute_until=None, reason: str = "") -> int:
+        """Put an account out of rotation for the upstream mute window.
+
+        UserMutedError reaches the client as a 429; without this the account
+        stayed idle and served the very next request, which repeats the
+        behaviour DeepSeek is punishing. Honors the mute_until the upstream
+        reports and applies ACCOUNT_MUTE_MIN_SECS as a floor when it sends
+        none. Deliberately does NOT schedule a health check: a settings probe
+        can pass while chat is still muted, so early re-admission would be
+        wrong.
+        """
+        now = time.time()
+        until = int(max(float(mute_until or 0), now + ACCOUNT_MUTE_MIN_SECS))
+        with self._lock:
+            acct.muted_until = until
+            acct.updated_at = _now()
+            if reason:
+                acct.last_error = reason
+            self._save_persisted_accounts_locked()
+        log.warning("account_muted", extra={
+            "id": acct.id, "email": acct.email, "muted_until": until,
+            "seconds": until - int(now), "reason": reason,
+        })
+        return until
 
     def _background_recover(self, acct: Account) -> None:
         try:

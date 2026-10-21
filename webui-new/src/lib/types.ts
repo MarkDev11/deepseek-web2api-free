@@ -35,6 +35,10 @@ export interface Account {
   error_count: number
   last_error: string
   last_used: number
+  /** Epoch seconds; 0 while the account is not under an upstream mute. */
+  muted_until: number
+  /** Live seconds left of the mute window (server-computed). */
+  muted_seconds_remaining: number
   created_at: number
   updated_at: number
   token_preview: string

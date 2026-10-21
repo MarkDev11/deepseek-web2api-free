@@ -73,6 +73,19 @@ export function AccountTable({ accounts, onEdit, onDelete, onSelect, onRefreshed
               </TableCell>
               <TableCell>
                 <StateBadge state={a.state} />
+                {a.muted_seconds_remaining > 0 && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Badge variant="destructive" className="ml-1.5">
+                        Muted {a.muted_seconds_remaining >= 60 ? Math.ceil(a.muted_seconds_remaining / 60) + 'm' : a.muted_seconds_remaining + 's'}
+                      </Badge>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      Upstream penalty active until {new Date(a.muted_until * 1000).toLocaleTimeString()}
+                      <br />Requests are rotated away from this account in the meantime.
+                    </TooltipContent>
+                  </Tooltip>
+                )}
               </TableCell>
               <TableCell>
                 <TokenExpiryBadge expiresIn={a.token_expires_in} />
