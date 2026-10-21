@@ -3,18 +3,20 @@ DeepSeek Chat API Adapter - WASM-based PoW solving, session management, streamin
 Supports expert mode (thinking_enabled, search_enabled).
 
 Anti-detection upgrades (2026-06):
-- TLS/JA3 impersonation via curl_cffi (chrome131)
+- TLS/JA3 impersonation via curl_cffi (chrome150)
 - Header set & values captured from a real Chrome 149 + chat.deepseek.com session
 - Cookie jar auto-rotates Set-Cookie (cf_clearance / awswaf token refresh)
 - Detects 405 x-amzn-waf-action=captcha and 403/429 cf-mitigated=challenge
 """
 import json
 import os
+import re
 import time
 import struct
 import base64
 import random
 import threading
+import tempfile
 import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -40,7 +42,7 @@ load_dotenv()
 log = get_logger("adapter")
 
 BASE_URL = "https://chat.deepseek.com"
-IMPERSONATE = os.environ.get("DEEPSEEK_IMPERSONATE", "chrome131")
+IMPERSONATE = os.environ.get("DEEPSEEK_IMPERSONATE", "chrome150")
 
 # Client fingerprint defaults, measured from a live browser request on
 # 2026-10-20 (see DeepSeekAdapter._base_headers). The upstream reads these as
@@ -51,6 +53,164 @@ CLIENT_VERSION = "2.5.0"
 CLIENT_LOCALE = "en_US"
 CLIENT_TZ_OFFSET = "25200"          # UTC+7
 ACCEPT_LANGUAGE = "en-US,en;q=0.8"
+CLIENT_BUNDLE_ID = os.environ.get("DEEPSEEK_CLIENT_BUNDLE_ID", "com.deepseek.chat")
+CLIENT_PLATFORM = os.environ.get("DEEPSEEK_CLIENT_PLATFORM", "web")
+
+# The web client reads its own version out of its bundle, so a pinned copy goes
+# stale the moment DeepSeek ships a new one (it already did: 2.3.0 -> 2.5.0).
+# With DEEPSEEK_CLIENT_SYNC on, one background thread per process reads the live
+# bundle, extracts the version string and hands it to every adapter created
+# afterwards. Best-effort by construction: an unreachable bundle, a WAF
+# challenge or an unparsable bundle all leave the pinned CLIENT_VERSION in
+# place, and the fetch never sits on the request path (a cold start pays
+# nothing). The result is cached on disk so warm instances do not refetch.
+_BUNDLE_URL_RE = re.compile(
+    r"https://fe-static\.deepseek\.com/chat/static/main\.[0-9a-f]+\.js"
+)
+_BUNDLE_VERSION_RE = re.compile(r'version:"(\d+\.\d+\.\d+)"')
+_SYNC_CACHE_PATH = Path(
+    os.environ.get("DEEPSEEK_CLIENT_SYNC_CACHE")
+    or str(Path(tempfile.gettempdir()) / "ds_client_fingerprint.json")
+)
+try:
+    _SYNC_TTL_SECS = max(60, int(os.environ.get("DEEPSEEK_CLIENT_SYNC_TTL_SECS", "86400")))
+except ValueError:
+    _SYNC_TTL_SECS = 86400
+_client_sync = {"version": "", "bundle_url": "", "checked_at": 0.0}
+_client_sync_lock = threading.Lock()
+_client_sync_started = False
+
+
+def parse_client_version(bundle_text: str) -> str:
+    """Return the client version the web bundle reports, or "" if absent."""
+    m = _BUNDLE_VERSION_RE.search(bundle_text or "")
+    return m.group(1) if m else ""
+
+
+def current_client_version() -> str:
+    """Explicit env override > version learned from the live bundle > pinned."""
+    env = (os.environ.get("DEEPSEEK_CLIENT_VERSION") or "").strip()
+    if env:
+        return env
+    with _client_sync_lock:
+        learned = _client_sync["version"]
+    return learned or CLIENT_VERSION
+
+
+def client_sync_state() -> dict:
+    with _client_sync_lock:
+        return dict(_client_sync)
+
+
+def _load_sync_cache() -> None:
+    try:
+        data = json.loads(_SYNC_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    with _client_sync_lock:
+        if data.get("version") and not _client_sync["version"]:
+            _client_sync["version"] = str(data["version"])
+        if data.get("bundle_url") and not _client_sync["bundle_url"]:
+            _client_sync["bundle_url"] = str(data["bundle_url"])
+        try:
+            if data.get("checked_at"):
+                _client_sync["checked_at"] = float(data["checked_at"])
+        except (TypeError, ValueError):
+            pass
+
+
+def _save_sync_cache() -> None:
+    try:
+        _SYNC_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _client_sync_lock:
+            data = dict(_client_sync)
+        _SYNC_CACHE_PATH.write_text(json.dumps(data), encoding="utf-8")
+    except Exception as e:
+        log.debug("client_sync_cache_write_failed", extra={"error": str(e)})
+
+
+def sync_client_fingerprint(timeout: float = 10.0, cookies: str = "") -> dict:
+    """Read the live SPA bundle and adopt the client version it reports.
+
+    Returns the state dict. Never raises: this is fingerprint freshness, not a
+    request prerequisite.
+    """
+    with _client_sync_lock:
+        fresh = (
+            _client_sync["checked_at"]
+            and time.time() - _client_sync["checked_at"] < _SYNC_TTL_SECS
+        )
+        if fresh:
+            return dict(_client_sync)
+    bundle_url = ""
+    # The index page sits behind the WAF challenge (202 without a token) while
+    # the static bundle does not, so the discovery hop reuses the account's own
+    # cookies -- the same request a browser makes when it opens the app.
+    headers = {"Cookie": cookies} if cookies else None
+    try:
+        home = cffi_requests.get(
+            BASE_URL + "/",
+            impersonate=IMPERSONATE,
+            timeout=timeout,
+            headers=headers,
+        )
+        m = _BUNDLE_URL_RE.search(home.text or "")
+        bundle_url = m.group(0) if m else ""
+        if home.status_code != 200:
+            log.debug("client_sync_home_status", extra={"status": home.status_code})
+    except Exception as e:
+        log.debug("client_sync_home_failed", extra={"error": str(e)})
+    if not bundle_url:
+        with _client_sync_lock:
+            bundle_url = _client_sync["bundle_url"]
+    if not bundle_url:
+        return client_sync_state()
+    version = ""
+    try:
+        resp = cffi_requests.get(bundle_url, impersonate=IMPERSONATE, timeout=timeout)
+        if resp.status_code == 200:
+            version = parse_client_version(resp.text or "")
+    except Exception as e:
+        log.debug("client_sync_bundle_failed", extra={"error": str(e)})
+    with _client_sync_lock:
+        previous = _client_sync["version"]
+        _client_sync["bundle_url"] = bundle_url
+        _client_sync["checked_at"] = time.time()
+        if version:
+            _client_sync["version"] = version
+        state = dict(_client_sync)
+    if version and version != previous:
+        log.info(
+            "client_fingerprint_synced",
+            extra={"version": version, "previous": previous, "bundle_url": bundle_url},
+        )
+    elif not version:
+        log.debug("client_sync_no_version", extra={"bundle_url": bundle_url})
+    _save_sync_cache()
+    return state
+
+
+def _start_client_sync(cookies: str = "") -> None:
+    """Kick the one-per-process bundle sync (enabled by DEEPSEEK_CLIENT_SYNC)."""
+    global _client_sync_started
+    flag = (os.environ.get("DEEPSEEK_CLIENT_SYNC") or "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return
+    with _client_sync_lock:
+        if _client_sync_started:
+            return
+        _client_sync_started = True
+    threading.Thread(
+        target=sync_client_fingerprint,
+        kwargs={"cookies": cookies},
+        name="client-fingerprint-sync",
+        daemon=True,
+    ).start()
+
+
+_load_sync_cache()
 try:
     JITTER_SECS = max(0.0, float(os.environ.get("DEEPSEEK_JITTER_SECS", "0.4") or 0))
 except ValueError:
@@ -311,19 +471,19 @@ class _WASMSolver:
 class DeepSeekAdapter:
     """Adapter for DeepSeek Chat API"""
 
-    # Captured 2026-06-19 from a live Chrome 149 session on chat.deepseek.com.
-    # We DOWNGRADE the UA string to Chrome 131 to match what curl_cffi's
-    # `chrome131` impersonation profile actually negotiates at the TLS layer:
-    # the JA3/JA4 fingerprint comes from a Chrome 131 build, so a Chrome 149
-    # UA on a Chrome 131 ClientHello is itself a fingerprint mismatch. Bump
-    # both together when curl_cffi adds newer chrome profiles.
+    # The UA and Sec-Ch-Ua must describe the ClientHello curl_cffi actually
+    # sends (DEEPSEEK_IMPERSONATE), never the browser a capture happened to
+    # use: a newer UA on an older TLS profile is exactly the kind of mismatch
+    # these headers are supposed to avoid. chrome150 is the newest profile this
+    # curl_cffi build knows (0.16.3), so the defaults move together with it --
+    # bump all three (impersonate, UA, brand) in one commit, never one alone.
     _DEFAULT_UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
+        "Chrome/150.0.0.0 Safari/537.36"
     )
     _DEFAULT_SEC_CH_UA = (
-        '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+        '"Google Chrome";v="150", "Chromium";v="150", "Not_A Brand";v="24"'
     )
 
     def __init__(self, token: str, cookies: str,
@@ -362,7 +522,13 @@ class DeepSeekAdapter:
                     )
 
         self._msg_counters: dict[str, int] = {}
-        version = (os.environ.get("DEEPSEEK_CLIENT_VERSION") or CLIENT_VERSION).strip()
+        version = current_client_version()
+        # Read at construction time (not import time) so a deployment can
+        # override them without touching the module constants.
+        bundle_id = (os.environ.get("DEEPSEEK_CLIENT_BUNDLE_ID") or CLIENT_BUNDLE_ID).strip()
+        client_platform = (
+            os.environ.get("DEEPSEEK_CLIENT_PLATFORM") or CLIENT_PLATFORM
+        ).strip()
         client_locale = (os.environ.get("DEEPSEEK_CLIENT_LOCALE") or CLIENT_LOCALE).strip()
         tz_offset = (os.environ.get("DEEPSEEK_CLIENT_TZ_OFFSET") or CLIENT_TZ_OFFSET).strip()
         accept_language = (
@@ -396,13 +562,16 @@ class DeepSeekAdapter:
             # impersonation target: they must agree with the TLS fingerprint of
             # the session, so they are deliberately not taken from this capture.
             "X-Client-Version": version,
-            "X-Client-Platform": "web",
+            "X-Client-Platform": client_platform,
             "X-Client-Locale": client_locale,
             "X-Client-Timezone-Offset": tz_offset,
-            "x-client-bundle-id": "com.deepseek.chat",
+            "x-client-bundle-id": bundle_id,
         }
         if device_id:
             self._base_headers["X-Device-Id"] = device_id
+        # Best-effort, off the request path: learns the current client version
+        # from the live bundle (DEEPSEEK_CLIENT_SYNC=1).
+        _start_client_sync(self.cookies)
 
     @staticmethod
     def _normalize_token(token: str) -> str:

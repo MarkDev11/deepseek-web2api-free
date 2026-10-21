@@ -22,6 +22,32 @@ from api_key_store import get_api_key_store
 
 log = get_logger("admin")
 
+
+def _client_fingerprint() -> dict:
+    """Effective client fingerprint: env override > bundle-synced > pinned."""
+    import adapter as _adapter
+
+    state = _adapter.client_sync_state()
+    sync_flag = (os.environ.get("DEEPSEEK_CLIENT_SYNC") or "").strip().lower()
+    return {
+        "impersonate": _adapter.IMPERSONATE,
+        "version": _adapter.current_client_version(),
+        "pinned_version": _adapter.CLIENT_VERSION,
+        "synced_version": state.get("version", ""),
+        "synced_at": int(state.get("checked_at", 0)) or None,
+        "sync_enabled": sync_flag in ("1", "true", "yes", "on"),
+        "platform": os.environ.get("DEEPSEEK_CLIENT_PLATFORM")
+        or _adapter.CLIENT_PLATFORM,
+        "bundle_id": os.environ.get("DEEPSEEK_CLIENT_BUNDLE_ID")
+        or _adapter.CLIENT_BUNDLE_ID,
+    }
+
+
+def _impersonate_default() -> str:
+    import adapter as _adapter
+
+    return _adapter.IMPERSONATE
+
 # ── Admin password (set DEEPSEEK_ADMIN_PASSWORD in .env) ──────
 _ADMIN_PASSWORD = os.environ.get("DEEPSEEK_ADMIN_PASSWORD", "admin")
 # Insecure defaults that we explicitly forbid on a public bind unless
@@ -445,7 +471,10 @@ async def env_info(request: Request):
             {"name": "LOG_FORMAT", "value": _env("LOG_FORMAT") or "json", "is_default": _flag("LOG_FORMAT") == "default"},
             {"name": "DSML_MAX_BUFFER_BYTES", "value": _env("DSML_MAX_BUFFER_BYTES") or "1048576", "is_default": _flag("DSML_MAX_BUFFER_BYTES") == "default"},
             {"name": "STATS_HISTORY_INTERVAL_SECS", "value": _env("STATS_HISTORY_INTERVAL_SECS") or "30", "is_default": _flag("STATS_HISTORY_INTERVAL_SECS") == "default"},
-            {"name": "DEEPSEEK_IMPERSONATE", "value": _env("DEEPSEEK_IMPERSONATE") or "chrome131", "is_default": _flag("DEEPSEEK_IMPERSONATE") == "default"},
+            {"name": "DEEPSEEK_IMPERSONATE", "value": _env("DEEPSEEK_IMPERSONATE") or _impersonate_default(), "is_default": _flag("DEEPSEEK_IMPERSONATE") == "default"},
+            {"name": "DEEPSEEK_CLIENT_SYNC", "value": _env("DEEPSEEK_CLIENT_SYNC") or "off", "is_default": _flag("DEEPSEEK_CLIENT_SYNC") == "default"},
+            {"name": "DEEPSEEK_CLIENT_BUNDLE_ID", "value": _env("DEEPSEEK_CLIENT_BUNDLE_ID") or _client_fingerprint()["bundle_id"], "is_default": _flag("DEEPSEEK_CLIENT_BUNDLE_ID") == "default"},
+            {"name": "DEEPSEEK_CLIENT_PLATFORM", "value": _env("DEEPSEEK_CLIENT_PLATFORM") or _client_fingerprint()["platform"], "is_default": _flag("DEEPSEEK_CLIENT_PLATFORM") == "default"},
             {"name": "DEEPSEEK_JITTER_SECS", "value": _env("DEEPSEEK_JITTER_SECS") or "0.0", "is_default": _flag("DEEPSEEK_JITTER_SECS") == "default"},
             {"name": "TOKEN_REFRESH_ENABLED", "value": _env("TOKEN_REFRESH_ENABLED") or "1", "is_default": _flag("TOKEN_REFRESH_ENABLED") == "default"},
             {"name": "TOKEN_REFRESH_AHEAD_SECS", "value": _env("TOKEN_REFRESH_AHEAD_SECS") or "900", "is_default": _flag("TOKEN_REFRESH_AHEAD_SECS") == "default"},
@@ -454,6 +483,7 @@ async def env_info(request: Request):
             {"name": "DEEPSEEK_CREDENTIAL_CHECK_PATH", "value": _env("DEEPSEEK_CREDENTIAL_CHECK_PATH") or "/api/v0/users/settings", "is_default": _flag("DEEPSEEK_CREDENTIAL_CHECK_PATH") == "default"},
         ],
         "credential_store": credential_store.describe(),
+        "client_fingerprint": _client_fingerprint(),
     }
 
 
