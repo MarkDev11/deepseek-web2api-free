@@ -823,6 +823,25 @@ class AccountPool:
             acct._refreshing = True
         return self._do_refresh(acct, "manual")
 
+    def wait_for_refresh(self, acct: Account, timeout: float = 15.0) -> bool:
+        """Block until an in-flight refresh of *acct* concludes.
+
+        The request-path refresh and the background keep-alive share the
+        same `_refreshing` mutex; without this a cold-start request that
+        collides with a keep-alive fails with "already in progress" instead
+        of simply waiting out that check. Returns True when the slot was
+        observed free again (result unknown — the caller must re-test),
+        False when `timeout` elapsed.
+        """
+        deadline = time.time() + timeout
+        while True:
+            with self._lock:
+                if not acct._refreshing:
+                    return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.1)
+
     def refresh_by_id(self, account_id: str) -> tuple[bool, str]:
         """Manual entry point (admin API / panel button)."""
         with self._lock:

@@ -63,6 +63,8 @@
 
 **顺带修掉的线上 500（v3.3.11）**：`GET /admin/api/env` 在 Vercel 上一直 500，原因是环境变量里 `PORT` 存在但**值为空字符串**，而代码写的是 `int(os.environ.get("PORT", "8080"))`——`get` 的默认值只在键缺失时生效，空串照样进 `int("")` 抛 `ValueError`，于是整个 Settings 页拿不到配置。现在所有数值型读取都改成 `int(os.environ.get("X") or <默认>)`（`admin.py` 的 port、`adapter.py` 的 `DEEPSEEK_CLIENT_SYNC_TTL_SECS`、`server.py` 的 `DEEPSEEK_MAX_CONCURRENCY`）。面板版本号也不再硬编码 `3.3.8`，改为 `admin.SERVER_VERSION`，并由 `tests/test_admin_env.py` 钉住它与 `server.app.version` 一致（三个用例：空串 env 不再炸、两条新变量行存在、版本号同步）。**排查提示**：以后线上出现「某个只读面板接口 500」但 `/health` 正常，先看那个接口里的 `int(...)`，再去核对 Vercel 上是否有空值变量。
 
+**部署首请求的 502 竞争（v3.3.11 上线实测）**：v3.3.11 部署后的第一个真实请求吃到一次 502：冷启动那次 `acquire()` 选中了死账号，后台 keep-alive 校验与请求路径的 `refresh_account()` 同时抢同一个 `_refreshing` 互斥，请求路径拿到 `credential refresh already in progress` 就直接把「凭证失效且刷新失败」回给客户端。修法是 `AccountPool.wait_for_refresh()`（轮询互斥最多 `ACCOUNT_REFRESH_WAIT_SECS`=15s）+ `AcquiredAccount.create_session()` 在「already in progress」时**等互斥空出来再重试一次 `adapter.create_session()`**：keep-alive 要么刷新成功要么已把账号隔离，重试就是事实裁定。回归测试 `tests/test_session_refresh_race.py`（4 例：竞争被等出来 / 真死账号仍报「去浏览器复制新 token」/ 互斥空闲立即返回 / 互斥被占超时返回 False）。注意 `ACCOUNT_REFRESH_WAIT_SECS` 只管这一次等待，不重复排队。
+
 **结论（也写给用户看）**：cookie 会自动跟着活会话更新、死 token 会立刻被摘出轮转并在面板写明「去浏览器复制新 token」，但 token 本身仍然只能由人在浏览器登录时签发。
 
 **DeepSeek 账号 token 不是 JWT（2026-10-20 实测）**：从浏览器 `localStorage.userToken`（形如 `{"value":"…","__version":"0"}`）取到的 token 是 **64 字符不透明串**（含 `+` `/`），与请求头 `authorization: Bearer …` 逐字一致；`settingsJwt` 是加密的设置 blob，不是凭证。因此 `credentials.token_expires_at` 恒为 `None`：WebUI 的 Token expiry 徽章显示 `—`，**主动刷新不会触发**，实际生效的是被动刷新（HTTP 200 + `code 40003`）和手动 Refresh。取凭证还要注意 cookie：`ds_session_id` 是 HttpOnly，`document.cookie` 看不到，必须从 Network 请求头复制。

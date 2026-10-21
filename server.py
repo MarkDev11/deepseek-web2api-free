@@ -431,6 +431,25 @@ class AcquiredAccount:
             # once, so a rollover costs the caller a few hundred milliseconds
             # instead of a failed request.
             ok, msg = pool.refresh_account(self.acct)
+            if not ok and "already in progress" in msg:
+                # A background keep-alive picked this account at the same
+                # moment and holds the refresh mutex. Waiting it out is the
+                # difference between a spurious 502 on the first request
+                # after a cold start and a normal answer: the keep-alive
+                # either refreshes or quarantines the account, and the retry
+                # below is the ground truth either way.
+                pool.wait_for_refresh(
+                    self.acct,
+                    timeout=float(os.environ.get("ACCOUNT_REFRESH_WAIT_SECS") or 15),
+                )
+                try:
+                    ds_id = self.adapter.create_session()
+                except UpstreamAuthError as retry_error:
+                    raise UpstreamAuthError(
+                        f"credentials rejected and refresh failed: {retry_error}"
+                    ) from None
+                self._finish_session(ds_id)
+                return ds_id
             if not ok:
                 raise UpstreamAuthError(
                     f"credentials rejected and refresh failed: {msg}") from None
@@ -441,6 +460,12 @@ class AcquiredAccount:
             self._cached_session = None
             pool.mark_recovered(self.acct)
             ds_id = self.adapter.create_session()
+        self._finish_session(ds_id)
+        return ds_id
+
+    def _finish_session(self, ds_id: str) -> None:
+        """Book-keep a freshly created upstream session (shared by the retry
+        paths above)."""
         self._session_id = ds_id
         if self._cache_key:
             sess = ChatSession(chat_session_id=ds_id, account_id=self.acct.id)
@@ -448,7 +473,6 @@ class AcquiredAccount:
             # Keep the live reference so record_message_id() can update the
             # parent id in place (the cache stores the same object).
             self._cached_session = sess
-        return ds_id
 
     def prepare_prompt(self, full_prompt: str) -> str:
         """Return the prompt to send upstream for this turn.
