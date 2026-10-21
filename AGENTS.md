@@ -61,6 +61,8 @@
 
 回归测试：`tests/test_account_keepalive.py`（9 例：拒绝即隔离 / 网络抖动不隔离 / 通过校验解除隔离 / 成功回合回写 cookie 并持久化 / jar 未变不写盘 / 持久化节流 / 过期账号后台复检 / 新鲜账号不复检 / 关开关不复检）；`tests/conftest.py` 新增 autouse fixture 把 `ACCOUNT_KEEPALIVE_SECS` 默认关掉，**单测永不联网**（pacing/refresh 那批用真 adapter + 假 token 的用例，否则首次 `acquire()` 就会被真实上游判 40003 而误隔离）。`/admin/api/env` 新增 `ACCOUNT_KEEPALIVE_SECS`、`ACCOUNT_COOKIE_PERSIST_SECS` 两行。
 
+**顺带修掉的线上 500（v3.3.11）**：`GET /admin/api/env` 在 Vercel 上一直 500，原因是环境变量里 `PORT` 存在但**值为空字符串**，而代码写的是 `int(os.environ.get("PORT", "8080"))`——`get` 的默认值只在键缺失时生效，空串照样进 `int("")` 抛 `ValueError`，于是整个 Settings 页拿不到配置。现在所有数值型读取都改成 `int(os.environ.get("X") or <默认>)`（`admin.py` 的 port、`adapter.py` 的 `DEEPSEEK_CLIENT_SYNC_TTL_SECS`、`server.py` 的 `DEEPSEEK_MAX_CONCURRENCY`）。面板版本号也不再硬编码 `3.3.8`，改为 `admin.SERVER_VERSION`，并由 `tests/test_admin_env.py` 钉住它与 `server.app.version` 一致（三个用例：空串 env 不再炸、两条新变量行存在、版本号同步）。**排查提示**：以后线上出现「某个只读面板接口 500」但 `/health` 正常，先看那个接口里的 `int(...)`，再去核对 Vercel 上是否有空值变量。
+
 **结论（也写给用户看）**：cookie 会自动跟着活会话更新、死 token 会立刻被摘出轮转并在面板写明「去浏览器复制新 token」，但 token 本身仍然只能由人在浏览器登录时签发。
 
 **DeepSeek 账号 token 不是 JWT（2026-10-20 实测）**：从浏览器 `localStorage.userToken`（形如 `{"value":"…","__version":"0"}`）取到的 token 是 **64 字符不透明串**（含 `+` `/`），与请求头 `authorization: Bearer …` 逐字一致；`settingsJwt` 是加密的设置 blob，不是凭证。因此 `credentials.token_expires_at` 恒为 `None`：WebUI 的 Token expiry 徽章显示 `—`，**主动刷新不会触发**，实际生效的是被动刷新（HTTP 200 + `code 40003`）和手动 Refresh。取凭证还要注意 cookie：`ds_session_id` 是 HttpOnly，`document.cookie` 看不到，必须从 Network 请求头复制。

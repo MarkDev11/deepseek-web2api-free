@@ -580,7 +580,7 @@ def _acquire(cache_key: str | None = None) -> AcquiredAccount:
 
 def _upstream_limit_from_env() -> int:
     try:
-        return max(1, int(os.environ.get("DEEPSEEK_MAX_CONCURRENCY", "2")))
+        return max(1, int(os.environ.get("DEEPSEEK_MAX_CONCURRENCY") or 2))
     except ValueError:
         return 2
 

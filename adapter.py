@@ -73,7 +73,7 @@ _SYNC_CACHE_PATH = Path(
     or str(Path(tempfile.gettempdir()) / "ds_client_fingerprint.json")
 )
 try:
-    _SYNC_TTL_SECS = max(60, int(os.environ.get("DEEPSEEK_CLIENT_SYNC_TTL_SECS", "86400")))
+    _SYNC_TTL_SECS = max(60, int(os.environ.get("DEEPSEEK_CLIENT_SYNC_TTL_SECS") or 86400))
 except ValueError:
     _SYNC_TTL_SECS = 86400
 _client_sync = {"version": "", "bundle_url": "", "checked_at": 0.0}

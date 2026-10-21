@@ -236,6 +236,9 @@ class StatsSnapshot:
 _stats = StatsSnapshot()
 _pool = AccountPool()
 
+# Kept in sync with server.app.version by tests/test_admin_env.py.
+SERVER_VERSION = "3.3.11"
+
 
 def get_pool() -> AccountPool:
     return _pool
@@ -424,7 +427,9 @@ async def env_info(request: Request):
 
     return {
         "host": os.environ.get("HOST", "127.0.0.1"),
-        "port": int(os.environ.get("PORT", "8080")),
+        # Vercel env vars can be present but empty (PORT="" is a common one),
+        # so every numeric read falls back on falsy, not just on missing.
+        "port": int(os.environ.get("PORT") or 8080),
         "insecure_public_defaults": os.environ.get("ALLOW_INSECURE_PUBLIC_DEFAULTS", "false").lower() in {"1", "true", "yes", "on"},
         "admin_password_set": bool(admin_pwd),
         "admin_password_weak": admin_pwd in {"", "admin", "password", "123456", "changeme"},
@@ -449,7 +454,7 @@ async def env_info(request: Request):
         "log_format": os.environ.get("LOG_FORMAT", "json").lower(),
         "dsml_max_buffer_bytes": int(os.environ.get("DSML_MAX_BUFFER_BYTES", "1048576") or 1048576),
         "uptime_secs": int(time.time() - _stats.start_time),
-        "server_version": "3.3.8",
+        "server_version": SERVER_VERSION,
         "env_overrides": [
             {"name": "HOST", "value": _env("HOST") or "127.0.0.1", "is_default": _flag("HOST") == "default"},
             {"name": "PORT", "value": _env("PORT") or "8080", "is_default": _flag("PORT") == "default"},
