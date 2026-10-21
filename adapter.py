@@ -732,6 +732,19 @@ class DeepSeekAdapter:
                 log.debug("cookie_blob_failed", extra={"error": str(e)})
         return "; ".join(parts)
 
+    def sync_cookies(self) -> bool:
+        """Adopt the live jar into `self.cookies`; True when it changed.
+
+        Callers persist the returned blob so the account record carries the
+        rotating WAF/session cookies instead of the values typed in when the
+        account was added.
+        """
+        blob = self.cookie_blob()
+        if not blob or blob == self.cookies:
+            return False
+        self.cookies = blob
+        return True
+
     def refresh_credentials(self) -> dict:
         """Mint fresh credentials using the current ones.
 

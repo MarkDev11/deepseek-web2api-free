@@ -71,6 +71,20 @@ ACCOUNT_COOLDOWN_MAX_WAIT_SECS = _env_seconds("ACCOUNT_COOLDOWN_MAX_WAIT_SECS", 
 # Floor for a mute the upstream did not timestamp: the account stays out of
 # rotation at least this long instead of being retried on the next request.
 ACCOUNT_MUTE_MIN_SECS = _env_seconds("ACCOUNT_MUTE_MIN_SECS", 300.0)
+# Session keep-alive & credential auto-sync (v3.3.11).
+#   DeepSeek mints a bearer token only at login (adapter.CREDENTIAL_CHECK_PATH),
+#   so nothing here can renew a dead token; what this CAN do is keep the STORED
+#   copy of the session current:
+#   * after every successful upstream turn the rotating cookies in the adapter
+#     jar (ds_session_id / aws-waf-token) are mirrored back into the account
+#     record, so a cold start resumes the freshest session instead of a stale
+#     one that may already be invalid;
+#   * a stale account is re-verified in the background the next time it is
+#     picked, so a rejected token is quarantined BEFORE a user request burns on
+#     it (0 disables the re-check).
+ACCOUNT_KEEPALIVE_SECS = _env_seconds("ACCOUNT_KEEPALIVE_SECS", 900.0)
+# How often rotated cookies may be written to the store (KV/file) per account.
+ACCOUNT_COOKIE_PERSIST_SECS = _env_seconds("ACCOUNT_COOKIE_PERSIST_SECS", 300.0)
 
 # Credential refresh (DeepSeek tokens and their cookies are short-lived).
 #   proactive: when a token is within TOKEN_REFRESH_AHEAD_SECS of its JWT "exp"
@@ -147,7 +161,9 @@ class Account:
     last_refresh_at: int = 0       # last attempt (success or failure)
     last_refresh_status: str = ""  # "" | "ok" | "failed"
     last_refresh_error: str = ""
+    last_ok_at: int = 0            # last upstream turn that actually succeeded
     _adapter: Optional[DeepSeekAdapter] = field(default=None, repr=False)
+    _cookies_saved_at: float = field(default=0.0, repr=False)
     _refreshing: bool = field(default=False, repr=False)
 
     def sync_token_expiry(self) -> int:
@@ -192,6 +208,7 @@ class Account:
             "last_refresh_at": self.last_refresh_at,
             "last_refresh_status": self.last_refresh_status,
             "last_refresh_error": self.last_refresh_error,
+            "last_ok_at": self.last_ok_at,
         }
 
     def to_store_dict(self) -> dict:
@@ -206,6 +223,7 @@ class Account:
             "last_refresh_at": self.last_refresh_at,
             "last_refresh_status": self.last_refresh_status,
             "last_refresh_error": self.last_refresh_error,
+            "last_ok_at": self.last_ok_at,
             "muted_until": self.muted_until,
         }
 
@@ -284,6 +302,7 @@ class AccountPool:
                 last_refresh_at=int(item.get("last_refresh_at") or 0),
                 last_refresh_status=str(item.get("last_refresh_status") or ""),
                 last_refresh_error=str(item.get("last_refresh_error") or ""),
+                last_ok_at=int(item.get("last_ok_at") or 0),
                 muted_until=int(item.get("muted_until") or 0),
             )
             # The live token wins over a stored expiry: credentials may have
@@ -467,6 +486,7 @@ class AccountPool:
                     acct.state = "busy"
                     acct.last_used = time.time()
                     self._schedule_refresh_locked(acct)
+                    self._maybe_verify_locked(acct)
                     return acct
                 for other in self._accounts:
                     if other.state != "idle":
@@ -500,6 +520,7 @@ class AccountPool:
                     acct.state = "busy"
                     acct.last_used = time.time()
                     self._schedule_refresh_locked(acct)
+                    self._maybe_verify_locked(acct)
                     return acct
             return None
     def release(self, acct: Account):
@@ -633,6 +654,13 @@ class AccountPool:
         adapter.CREDENTIAL_CHECK_PATH), so the panel's Refresh verifies rather
         than renews. Only a success may lift a quarantined account - a failed
         check must not mark a dead account healthy again.
+
+        A DEFINITIVE rejection (40003 / auth wording) quarantines the account
+        right here. Without that, a token dead in storage stayed `idle`, so
+        acquire() kept handing it to chat requests and every one of them failed
+        with a 502 until the next round-robin lap marked it. Refreshing the
+        panel only reported the problem; now it also takes the account out of
+        rotation, which is what the message always implied.
         """
         detail = check.get("detail") or check.get("msg") or "credential check failed"
         if not check.get("ok") and is_auth_failure(check.get("code"), check.get("msg") or ""):
@@ -646,6 +674,11 @@ class AccountPool:
                     acct.state = "idle"
                 acct.error_count = 0
                 acct.last_error = ""
+            elif is_auth_failure(check.get("code"), check.get("msg") or ""):
+                # Quarantine only: the counter is left alone so a repeated
+                # check cannot ladder the account into the health-check path.
+                acct.state = "error"
+                acct.last_error = detail
             persist_error = ""
             try:
                 self._save_persisted_accounts_locked()
@@ -662,6 +695,66 @@ class AccountPool:
         if persist_error:
             msg += f" (warning: not persisted: {persist_error})"
         return bool(check.get("ok")), msg
+
+    def _maybe_verify_locked(self, acct: Account) -> None:
+        """Re-verify a stale account off the request path (keep-alive).
+
+        Called from acquire()/acquire_by_id() right after the account has been
+        claimed, so the extra GET rides along with a request that was going to
+        happen anyway. A rejected token is then quarantined in the background
+        instead of surfacing as a 502 for whoever draws that account next.
+        """
+        if ACCOUNT_KEEPALIVE_SECS <= 0 or acct._refreshing:
+            return
+        now = _now()
+        if acct.last_refresh_at and now - acct.last_refresh_at < ACCOUNT_KEEPALIVE_SECS:
+            return
+        acct._refreshing = True
+        threading.Thread(
+            target=self._refresh_worker, args=(acct, "keepalive"), daemon=True
+        ).start()
+
+    def record_upstream_ok(self, acct: Account) -> None:
+        """Mirror a successful upstream turn back into the account record.
+
+        The web session rotates its cookies continuously (`ds_session_id`,
+        `aws-waf-token`); the adapter's cookie jar holds the freshest copy, so
+        it is written back into the account and (throttled) into storage. This
+        is the part of "auto update" that is actually possible: the stored
+        session follows the live jar, while the bearer token itself is only
+        ever minted by a browser login.
+        """
+        try:
+            acct.adapter.sync_cookies()
+            blob = acct.adapter.cookie_blob()
+        except Exception as e:  # noqa: BLE001 - never fail a served request
+            log.warning("cookie_sync_failed", extra={"id": acct.id, "error": str(e)})
+            return
+        with self._lock:
+            acct.last_ok_at = _now()
+            if not blob or blob == acct.cookies:
+                return
+            acct.cookies = blob
+            now = time.time()
+            if now - acct._cookies_saved_at < ACCOUNT_COOKIE_PERSIST_SECS:
+                return
+            acct._cookies_saved_at = now
+            acct.updated_at = _now()
+            # Storage writes (KV round-trip) never block the request thread.
+            threading.Thread(
+                target=self._persist_cookies_async, args=(acct,), daemon=True
+            ).start()
+
+    def _persist_cookies_async(self, acct: Account) -> None:
+        with self._lock:
+            try:
+                self._save_persisted_accounts_locked()
+            except Exception as e:  # noqa: BLE001 - the in-memory copy is fresh
+                log.warning("cookie_sync_not_persisted",
+                            extra={"id": acct.id, "error": str(e)})
+                return
+        log.info("cookies_updated", extra={"id": acct.id})
+
 
     def _do_refresh(self, acct: Account, reason: str) -> tuple[bool, str]:
         """Verify an account's credentials, renewing them only where the upstream

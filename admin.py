@@ -480,6 +480,8 @@ async def env_info(request: Request):
             {"name": "ACCOUNT_COOLDOWN_SECS", "value": _env("ACCOUNT_COOLDOWN_SECS") or ("%g" % account_pool.ACCOUNT_COOLDOWN_SECS), "is_default": _flag("ACCOUNT_COOLDOWN_SECS") == "default"},
             {"name": "ACCOUNT_COOLDOWN_MAX_WAIT_SECS", "value": _env("ACCOUNT_COOLDOWN_MAX_WAIT_SECS") or ("%g" % account_pool.ACCOUNT_COOLDOWN_MAX_WAIT_SECS), "is_default": _flag("ACCOUNT_COOLDOWN_MAX_WAIT_SECS") == "default"},
             {"name": "ACCOUNT_MUTE_MIN_SECS", "value": _env("ACCOUNT_MUTE_MIN_SECS") or ("%g" % account_pool.ACCOUNT_MUTE_MIN_SECS), "is_default": _flag("ACCOUNT_MUTE_MIN_SECS") == "default"},
+            {"name": "ACCOUNT_KEEPALIVE_SECS", "value": _env("ACCOUNT_KEEPALIVE_SECS") or ("%g" % account_pool.ACCOUNT_KEEPALIVE_SECS), "is_default": _flag("ACCOUNT_KEEPALIVE_SECS") == "default"},
+            {"name": "ACCOUNT_COOKIE_PERSIST_SECS", "value": _env("ACCOUNT_COOKIE_PERSIST_SECS") or ("%g" % account_pool.ACCOUNT_COOKIE_PERSIST_SECS), "is_default": _flag("ACCOUNT_COOKIE_PERSIST_SECS") == "default"},
             {"name": "TOKEN_REFRESH_ENABLED", "value": _env("TOKEN_REFRESH_ENABLED") or "1", "is_default": _flag("TOKEN_REFRESH_ENABLED") == "default"},
             {"name": "TOKEN_REFRESH_AHEAD_SECS", "value": _env("TOKEN_REFRESH_AHEAD_SECS") or "900", "is_default": _flag("TOKEN_REFRESH_AHEAD_SECS") == "default"},
             {"name": "TOKEN_REFRESH_MIN_INTERVAL_SECS", "value": _env("TOKEN_REFRESH_MIN_INTERVAL_SECS") or "300", "is_default": _flag("TOKEN_REFRESH_MIN_INTERVAL_SECS") == "default"},

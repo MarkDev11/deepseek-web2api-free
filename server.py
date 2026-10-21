@@ -210,7 +210,7 @@ def _check_rate_limit(request: Request) -> dict:
     return headers
 
 
-app = FastAPI(title="DeepSeek Chat API", version="3.3.8")
+app = FastAPI(title="DeepSeek Chat API", version="3.3.11")
 
 # ── CORS ─────────────────────────────────────────────────────────────
 # Empty ALLOWED_ORIGINS ⇒ same-origin only. We deliberately do NOT set
@@ -525,6 +525,9 @@ class AcquiredAccount:
         cached session sent ``parent_message_id=0`` on the second turn and
         the upstream replied with an empty body.
         """
+        # A completed turn is proof the credentials still work: mirror the
+        # rotated session cookies back into the account while we are here.
+        pool.record_upstream_ok(self.acct)
         if not self._cache_key:
             return
         sess = self._cached_session
