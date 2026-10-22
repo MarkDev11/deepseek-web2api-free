@@ -1,0 +1,1 @@
+export const buildToolPrompt = (t, c) => 'stub'; export const stripMarkup = s => s; export const parseToolCalls = (t, n) => ({ calls: [], text: t }); export const createSieve = () => ({ feed: () => [], flush: () => [] });

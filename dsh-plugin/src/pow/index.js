@@ -1,0 +1,1 @@
+export const loadSolver = async (wasmPath) => ({ solve: async (challenge, salt, expireAt, difficulty) => { console.log('PoW stub'); return 123; } });

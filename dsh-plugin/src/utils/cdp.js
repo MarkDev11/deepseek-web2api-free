@@ -1,0 +1,1 @@
+export const launch = async () => ({ ws: 'ws://127.0.0.1:9222', close: () => {} });

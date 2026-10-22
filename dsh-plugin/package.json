@@ -1,16 +1,15 @@
 {
-  "name": "dsh-plugin-deepseek-web2api",
-  "version": "1.0.0",
+  "name": "dsh-plugin-dsweb",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
-  "description": "Mints and refreshes a deepseek-web2api session token for DeepSeek Harness (no manual provider setup).",
+  "description": "DeepSeek Harness native local provider: direct chat.deepseek.com client + OAuth-like browser login. Zero deps, no proxy deployment.",
   "main": "index.js",
   "exports": {
     ".": "./index.js"
   },
-  "dsh": {
-    "plugin": {
-      "kind": "adapter-host"
-    }
+  "scripts": {
+    "login": "node scripts/login.mjs",
+    "test": "node test/dsml.test.mjs && node test/capture.test.mjs"
   }
 }
