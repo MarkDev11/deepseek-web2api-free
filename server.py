@@ -210,7 +210,7 @@ def _check_rate_limit(request: Request) -> dict:
     return headers
 
 
-app = FastAPI(title="DeepSeek Chat API", version="3.3.12")
+app = FastAPI(title="DeepSeek Chat API", version="3.3.13")
 
 # ── CORS ─────────────────────────────────────────────────────────────
 # Empty ALLOWED_ORIGINS ⇒ same-origin only. We deliberately do NOT set
@@ -896,6 +896,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
                          model_type: str | None = None,
                          thinking_mode: bool = False, search_enabled: bool = False,
                          cache_key: str | None = None):
+    prompt_tokens = count_text(prompt)
     acq = _acquire(cache_key=cache_key)
     try:
         eff = acq.prepare_prompt(prompt)
@@ -910,7 +911,10 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             acq.record_message_id(ready_out["response_message_id"],
                                   ready_out.get("session_id"),
                                   full_prompt=prompt)
-        get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
+        completion_tokens = count_text(content) + count_text(thinking)
+        get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
+                           prompt_tokens=prompt_tokens,
+                           completion_tokens=completion_tokens)
     except RateLimitError as e:
         if isinstance(e, UserMutedError):
             # A mute is enforced server-side until mute_until: retrying this
@@ -964,6 +968,8 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         content_text=cleaned or content,
         tool_calls=tool_calls,
         thinking_text=thinking,
+        input_tokens=prompt_tokens,
+        output_tokens=count_text(cleaned or content) + count_text(thinking),
     )
 
 
@@ -997,6 +1003,7 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                                        ready_out=ready_out),
                 tool_names,
                 thinking_mode=thinking_mode,
+                input_tokens=count_text(prompt),
             ):
                 yield event
             if ready_out.get("response_message_id") is not None:

@@ -238,7 +238,7 @@ _stats = StatsSnapshot()
 _pool = AccountPool()
 
 # Kept in sync with server.app.version by tests/test_admin_env.py.
-SERVER_VERSION = "3.3.12"
+SERVER_VERSION = "3.3.13"
 
 
 def get_pool() -> AccountPool:

@@ -15,6 +15,7 @@ from tool_dsml import (
     build_dsml_tool_prompt,
 )
 from tool_sieve import StreamSieve
+from token_counter import count_text
 
 # ---- Pydantic models for Anthropic request ----
 
@@ -229,12 +230,14 @@ def _msg_id() -> str:
     return f"msg_{uuid.uuid4().hex[:24]}"
 
 
-def _message_start(msg_id: str, model: str) -> str:
+def _message_start(msg_id: str, model: str, input_tokens: int = 0) -> str:
+    # Downstream meters (e.g. the DSH token panel) treat negative counts as
+    # nonsense; emit real estimates instead of the historical -1 placeholder.
     msg = {
         "id": msg_id, "type": "message", "role": "assistant",
         "content": [], "model": model,
         "stop_reason": None, "stop_sequence": None,
-        "usage": {"input_tokens": -1, "output_tokens": -1},
+        "usage": {"input_tokens": max(0, input_tokens), "output_tokens": 0},
     }
     return f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': msg}, ensure_ascii=False)}\n\n"
 
@@ -253,8 +256,8 @@ def _block_stop(index: int) -> str:
     return f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index})}\n\n"
 
 
-def _message_delta(stop_reason: str = "end_turn") -> str:
-    return f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': -1}}, ensure_ascii=False)}\n\n"
+def _message_delta(stop_reason: str = "end_turn", output_tokens: int = 0) -> str:
+    return f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': max(0, output_tokens)}}, ensure_ascii=False)}\n\n"
 
 
 def _message_stop() -> str:
@@ -268,6 +271,8 @@ def build_nonstream_response(
     content_text: str | None,
     tool_calls: list[dict] | None = None,
     thinking_text: str | None = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
 ) -> dict:
     """Build Anthropic non-streaming response dict.
 
@@ -293,7 +298,7 @@ def build_nonstream_response(
         "content": content, "model": model,
         "stop_reason": "tool_use" if tool_calls else "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": -1, "output_tokens": -1},
+        "usage": {"input_tokens": max(0, input_tokens), "output_tokens": max(0, output_tokens)},
     }
 
 
@@ -303,14 +308,20 @@ def stream_response(
     msg_id: str, model: str, token_stream,
     tool_names: list[str],
     thinking_mode: bool = False,
+    input_tokens: int = 0,
 ):
-    """Generate Anthropic SSE events from adapter token stream."""
-    yield _message_start(msg_id, model)
+    """Generate Anthropic SSE events from adapter token stream.
+
+    ``input_tokens`` is the caller-side estimate for the full prompt; output
+    tokens are accumulated here from every emitted thinking/text/JSON delta.
+    """
+    yield _message_start(msg_id, model, input_tokens=input_tokens)
 
     idx = 0          # current content block index
     in_thinking = False
     in_text = False
     stop_reason = "end_turn"
+    out_tokens = 0
 
     def _close():
         nonlocal in_thinking, in_text, idx
@@ -349,6 +360,7 @@ def stream_response(
                     if not in_thinking:
                         yield from _open_thinking()
                     yield _block_delta(idx, "thinking_delta", thinking=content)
+                    out_tokens += count_text(content)
                 continue
 
         # Normal text token — feed to sieve
@@ -360,11 +372,12 @@ def stream_response(
                 if not in_text:
                     yield from _open_text()
                 yield _block_delta(idx, "text_delta", text=evt.data)
+                out_tokens += count_text(evt.data)
             elif evt.type == "tool_calls":
                 yield from _close()
                 yield from _emit_tool_use_blocks(evt.data, idx)
                 idx += len(evt.data)
-                yield _message_delta("tool_use")
+                yield _message_delta("tool_use", output_tokens=out_tokens)
                 yield _message_stop()
                 return
 
@@ -376,10 +389,11 @@ def stream_response(
             if not in_text:
                 yield from _open_text()
             yield _block_delta(idx, "text_delta", text=evt.data)
+            out_tokens += count_text(evt.data)
         elif evt.type == "tool_calls":
             yield from _close()
             yield from _emit_tool_use_blocks(evt.data, idx)
-            yield _message_delta("tool_use")
+            yield _message_delta("tool_use", output_tokens=out_tokens)
             yield _message_stop()
             return
 
@@ -395,7 +409,7 @@ def stream_response(
 
     # Close remaining blocks and finish
     yield from _close()
-    yield _message_delta(stop_reason)
+    yield _message_delta(stop_reason, output_tokens=out_tokens)
     yield _message_stop()
 
 
