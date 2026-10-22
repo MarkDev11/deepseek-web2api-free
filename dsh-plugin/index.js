@@ -101,8 +101,10 @@ function summarizeAccounts(body) {
   const now = Date.now() / 1000;
   const usable = accounts.filter((a) => {
     if (!a) return false;
-    if (a.status === "error") return false;
-    if (a.muted_until && Number(a.muted_until) > now) return false;
+    // /admin/api/accounts reports state=idle|busy|error, plus a mute deadline.
+    if (a.state === "error" || a.status === "error") return false;
+    const mutedUntil = Number(a.muted_until ?? 0);
+    if (mutedUntil > now) return false;
     return true;
   });
   return `${accounts.length} account(s), ${usable.length} usable`;
