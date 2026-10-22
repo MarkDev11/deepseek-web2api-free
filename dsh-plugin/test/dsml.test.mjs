@@ -63,4 +63,38 @@ assert.equal(r.tools.length, 1);
 assert.ok(!r.text.includes('DSML'), 'no stray closings, got: ' + JSON.stringify(r.text));
 assert.equal(r.text.trim(), 'Lanjut.');
 
+// v3 varian model: penutup polos, pipe nol, tag terpotong, pipe ASCII
+{
+  const bare = '<｜DSML｜invoke name="grep"> <｜DSML｜parameter name="path" string="true">a.md</｜DSML｜parameter> </invoke> </invoke>';
+  const s = new DsmlStreamSieve();
+  const r = [s.feed(bare), s.flush()];
+  const calls = r[0].toolCalls.concat(r[1].toolCalls);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'grep');
+  assert.equal(calls[0].parsedArguments.path, 'a.md');
+  assert.ok(!r[0].text.includes('DSML'));
+}
+{
+  const s = new DsmlStreamSieve();
+  const r = [s.feed('Baik. </DSML｜function_calls> lanjut'), s.flush()];
+  const txt = r[0].text + r[1].text;
+  assert.ok(!txt.includes('DSML'), 'pipe-nol close bocor: ' + txt);
+  assert.ok(txt.includes('Baik.') && txt.includes('lanjut'));
+}
+{
+  const s = new DsmlStreamSieve();
+  const r = [s.feed('Jawaban akhir </｜DSML｜invoke'), s.flush()];
+  const txt = r[0].text + r[1].text;
+  assert.ok(!txt.includes('DSML'), 'truncated close bocor: ' + txt);
+  assert.ok(txt.includes('Jawaban akhir'));
+}
+{
+  const ascii = '<|DSML|function_calls><|DSML|invoke name="t"><|DSML|parameter name="x" string="true">1</|DSML|parameter></|DSML|invoke></|DSML|function_calls>';
+  const s = new DsmlStreamSieve();
+  const r = [s.feed(ascii), s.flush()];
+  const calls = r[0].toolCalls.concat(r[1].toolCalls);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 't');
+  assert.equal(r[0].text + r[1].text, '');
+}
 console.log('dsml.test OK');
