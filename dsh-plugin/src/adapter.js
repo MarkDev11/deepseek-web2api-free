@@ -50,8 +50,8 @@ export class DsWebAdapter {
   }
   async listModels() {
     return [
-      { id: 'deepseek-chat', name: 'DeepSeek Chat (Local Native)', contextWindow: 1000000, maxTokens: 65536, input: ['text'] },
-      { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner (Local Native)', contextWindow: 1000000, maxTokens: 65536, input: ['text'] }
+      { id: 'deepseek-chat', name: 'DeepSeek Chat (Local Native)', contextWindow: 128000, maxTokens: 65536, input: ['text'] },
+      { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner (Local Native)', contextWindow: 128000, maxTokens: 65536, input: ['text'] }
     ];
   }
   async ensureAccount() {

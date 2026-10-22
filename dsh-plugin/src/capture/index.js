@@ -184,7 +184,7 @@ export async function probeAccountHealth(acct, timeoutMs) {
   } catch (e) {
     const kind = classifyProbeError(e);
     if (kind === 'network') return { ok: true, reason: 'network, dianggap ok' };
-    return { ok: false, reason: kind };
+    return { ok: false, reason: kind, muteUntil: (e && e.muteUntil) || undefined };
   }
 }
 
@@ -225,7 +225,7 @@ export async function launchOAuthPopupCapture(options) {
               return saved;
             }
             badTokens.add(cred.token);
-            if (health.reason === 'muted') store.markMuted(saved.id, Date.now() + 3600000);
+            if (health.reason === 'muted') store.markMuted(saved.id, health.muteUntil || Date.now() + 3600000);
             else store.markQuarantined(saved.id, 'login probe: ' + health.reason);
             // jendela dibiarkan terbuka: silakan logout & login akun lain, token baru akan dicoba lagi
           }
