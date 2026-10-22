@@ -1,0 +1,16 @@
+{
+  "name": "dsh-plugin-deepseek-web2api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mints and refreshes a deepseek-web2api session token for DeepSeek Harness (no manual provider setup).",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "dsh": {
+    "plugin": {
+      "kind": "adapter-host"
+    }
+  }
+}
