@@ -94,6 +94,14 @@ export class AccountStore {
     this.rr = (this.rr + 1) % usable.length;
     return pick;
   }
+  removeAccount(acctId) {
+    const d = this.load();
+    const before = d.accounts.length;
+    d.accounts = d.accounts.filter((a) => a.id !== acctId);
+    if (d.accounts.length === before) return false;
+    this.save(d);
+    return true;
+  }
   markQuarantined(acctId, reason) {
     const d = this.load();
     const a = d.accounts.find((x) => x.id === acctId);

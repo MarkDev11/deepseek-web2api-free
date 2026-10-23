@@ -136,7 +136,7 @@ export class DsWebAdapter {
         const isMuted = e && (e.code === 'USER_MUTED' || /muted|suspend/i.test(String(e && e.message || '')));
         const isAuth = e && (e.code === 40003 || /invalid token|authorization failed/i.test(String(e && e.message || '')));
         if (isMuted) this.store.markMuted(acct.id, e && e.muteUntil);
-        if (isAuth) this.store.markQuarantined(acct.id, String(e && e.message || e));
+        if (isAuth) this.store.removeAccount(acct.id); // token mati tak bisa pulih sendiri: hapus saja
         // akun mati/mute dan belum ada output -> coba akun lain (atau popup login) sekali
         if ((isMuted || isAuth || e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT') && !yielded && attempt === 0) { if (e.code === 'RATE_LIMIT') { await new Promise((rr) => setTimeout(rr, 6000)); } lastErr = e; continue; }
         throw e;
