@@ -64,6 +64,9 @@ export class DsWebAdapter {
   constructor(options) {
     const o = options || {};
     this.store = new AccountStore(o.storePath);
+    this.sessions = new Map();
+    this.keepAliveTtlMs = Number(o.keepAliveTtlMs || 300000);
+    this.lastUsedAt = new Map();
     this.autoLogin = o.autoLogin !== false;
   }
   async listModels() {
@@ -71,6 +74,16 @@ export class DsWebAdapter {
       { id: 'deepseek-chat', name: 'DeepSeek Chat (Local Native)', contextWindow: 200000, maxTokens: 65536, input: ['text'] },
       { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner (Local Native)', contextWindow: 200000, maxTokens: 65536, input: ['text'] }
     ];
+  }
+  keyFor(acct, opts) {
+    return acct.id + '|' + (opts && (opts.model || 'deepseek-chat')) + ((opts && opts.sessionKey != null) ? '|' + opts.sessionKey : '');
+  }
+  async sessionFor(acct, opts) {
+    const k = this.keyFor(acct, opts);
+    const s = this.sessions.get(k);
+    if (s && s.sessionId) { this.lastUsedAt.delete(k); s.reused = true; return s; }
+    this.lastUsedAt.delete(k);
+    return { sessionId: null, parentId: null, reused: false, at: 0 };
   }
   async ensureAccount() {
     let acct = this.store.acquireNext();
@@ -93,7 +106,8 @@ export class DsWebAdapter {
     };
     yield { type: 'block-start' };
     let lastErr;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let sess = null;
+    for (let attempt = 0; attempt < 2; attempt++ ) {
       const acct = await this.ensureAccount();
       const client = new WebClient(acct, { onCookies: (c) => this.store.updateCookies(acct.id, c) });
       const sieve = new DsmlStreamSieve();
@@ -105,8 +119,14 @@ export class DsWebAdapter {
       let sawTools = false;
       let yielded = false;
       try {
-        const sessionId = await client.createChatSession();
-        for await (const ev of client.streamCompletion({ sessionId, prompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false })) {
+        sess = await this.sessionFor(acct, opts);
+        const sessionId = sess.sessionId || (await client.createChatSession());
+        if (!sess.sessionId) { sess.sessionId = sessionId; this.sessions.set(this.keyFor(acct, opts), sess); }
+        sess.prompt = prompt;
+        let curParent = sess.parentId || null;
+        let nEvents = 0;
+        for await (const ev of client.streamCompletion({ sessionId, prompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent })) {
+          if (ev.type === 'meta' && ev.responseMessageId) { curParent = ev.responseMessageId; sess.parentId = curParent; sess.at = Date.now(); nEvents++; continue; }
           if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
             const tr = thinkSieve.feed(ev.delta);
             if (tr.text) yield { type: 'reasoning-delta', text: tr.text };
@@ -125,7 +145,24 @@ export class DsWebAdapter {
         const tailT = thinkSieve.flush();
         if (tailT.text) { yielded = true; yield { type: 'reasoning-delta', text: tailT.text }; }
         for (const tc of tailT.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
-        if (!yielded) { const ee = new Error('upstream returned an empty completion (no fragments; likely rate-limited)'); ee.code = 'RATE_LIMIT'; throw ee; }
+        if (!yielded) {
+          if (sess.reused) {
+            // sesi lama diabaikan upstream -> buka satu sesi baru (tetap satu sesi per percakapan)
+            sess.reused = false;
+            sess.parentId = null;
+            const sid2 = await client.createChatSession();
+            let n2 = 0;
+            for await (const e2 of client.streamCompletion({ sessionId: sid2, prompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: null })) {
+              if (e2.type === 'meta' && e2.responseMessageId) { sess.parentId = e2.responseMessageId; }
+              else if (e2.type === 'thinking' && e2.delta) { n2++; yield { type: 'reasoning-delta', text: e2.delta }; }
+              else if (e2.type === 'text' && e2.delta) { n2++; yield { type: 'text-delta', text: e2.delta }; }
+            }
+            sess.sessionId = sid2;
+            sess.prompt = prompt;
+            sess.at = Date.now();
+            if (!n2) { const ee2 = new Error('upstream returned an empty completion (no fragments; likely rate-limited)'); ee2.code = 'RATE_LIMIT'; throw ee2; }
+          } else { const ee = new Error('upstream returned an empty completion (no fragments; likely rate-limited)'); ee.code = 'RATE_LIMIT'; throw ee; }
+        }
         yield { type: 'block-end' };
         const inputTokens = Math.max(1, Math.ceil(prompt.length / 4));
         const outputTokens = Math.max(1, Math.ceil(outChars / 4));
@@ -139,6 +176,7 @@ export class DsWebAdapter {
         if (isAuth) this.store.removeAccount(acct.id); // token mati tak bisa pulih sendiri: hapus saja
         // akun mati/mute dan belum ada output -> coba akun lain (atau popup login) sekali
         if ((isMuted || isAuth || e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT') && !yielded && attempt === 0) { if (e.code === 'RATE_LIMIT') { await new Promise((rr) => setTimeout(rr, 6000)); } lastErr = e; continue; }
+        if (sess && sess.sessionId && !yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT')) { this.sessions.delete(this.keyFor(acct, opts)); this.lastUsedAt.set(this.keyFor(acct, opts), Date.now() + this.keepAliveTtlMs); }
         throw e;
       }
     }
