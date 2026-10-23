@@ -16,7 +16,12 @@ export function buildToolSystemPrompt(tools) {
     const fn = t.function || t;
     return JSON.stringify({ name: fn.name, description: fn.description || '', parameters: fn.parameters || { type: 'object', properties: {} } });
   }).join('\n');
-  return ['You can call tools by outputting ONLY a DSML block:', defs,
+  return [
+    'You can call tools by outputting a DSML block. STRICT RULES:',
+    '1. When you want to perform an action (read, write, run code, search, edit a file), you MUST reply with ONLY the DSML block below - no prose, no code snippets, no pseudo-calls like "const r = await tools.x(...)".',
+    '2. Never write JavaScript or tool syntax as plain text instead of a DSML block.',
+    '3. Use DSML only for real tool calls; never mention these tags in normal answers.',
+    'Available tools:', defs,
     DSML_BLOCK_START,
     '<\uff5cDSML\uff5cinvoke name="tool_name">',
     '<\uff5cDSML\uff5cparameter name="param" string="true">value</\uff5cDSML\uff5cparameter>',

@@ -1,6 +1,8 @@
 import { AccountStore, launchOAuthPopupCapture } from './capture/index.js';
 import { WebClient } from './upstream/index.js';
+import fs from 'node:fs';
 import { buildToolSystemPrompt, DsmlStreamSieve } from './dsml.js';
+const DBG = process.env.DSWEB_DEBUG ? fs.createWriteStream(process.env.DSWEB_DEBUG, { flags: 'a' }) : null;
 
 export function coerceToolArgs(parsed, schema) {
   if (!parsed || !schema || !schema.properties) return parsed;
@@ -101,9 +103,9 @@ export class DsWebAdapter {
       try {
         const sessionId = await client.createChatSession();
         for await (const ev of client.streamCompletion({ sessionId, prompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false })) {
-          if (ev.type === 'thinking' && ev.delta) { outChars += ev.delta.length; yielded = true; yield { type: 'reasoning-delta', text: ev.delta }; }
+          if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true; yield { type: 'reasoning-delta', text: ev.delta }; }
           else if (ev.type === 'text' && ev.delta) {
-            outChars += ev.delta.length; yielded = true;
+            if (DBG) DBG.write('X' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
             const r = sieve.feed(ev.delta);
             if (r.text) yield { type: 'text-delta', text: r.text };
             for (const tc of r.toolCalls) { sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; }
