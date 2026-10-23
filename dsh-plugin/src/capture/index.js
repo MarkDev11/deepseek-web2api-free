@@ -7,19 +7,35 @@ import { spawn } from 'node:child_process';
 export const DEFAULT_STORE_PATH = path.join(os.homedir(), '.dsh', 'dsweb-accounts.json');
 
 export function findSystemBrowser() {
+  const home = os.homedir();
   const bases = [
     process.env['PROGRAMFILES'],
+    process.env['PROGRAMFILES(X86)'],
     process.env['ProgramFiles(x86)'],
-    path.join(os.homedir(), 'AppData', 'Local')
+    'C:\\Program Files',
+    'C:\\Program Files (x86)',
+    path.join(home, 'AppData', 'Local'),
+    path.join(home, 'AppData', 'Local', 'Programs')
   ].filter(Boolean);
+  const apps = [
+    path.join('Google', 'Chrome', 'Application', 'chrome.exe'),
+    path.join('Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join('BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+    path.join('Google', 'Chrome SxS', 'Application', 'chrome.exe'),
+    path.join('Chrome Applications', 'chrome.exe'),
+    path.join('Chrome', 'Application', 'chrome.exe')
+  ];
   const candidates = [];
-  for (const b of bases) {
-    candidates.push(path.join(b, 'Google', 'Chrome', 'Application', 'chrome.exe'));
-    candidates.push(path.join(b, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
-    candidates.push(path.join(b, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'));
-  }
+  for (const b of bases) for (const a of apps) candidates.push(path.join(b, a));
+  // jalur per-user: 'AppData\Local' sudah dicakup oleh basis di atas + apps 'Google/Chrome/...'
   for (const c of candidates) if (fs.existsSync(c)) return c;
-  throw new Error('Chrome / Edge / Brave tidak ditemukan di sistem.');
+  // terakhir: cari di PATH
+  const pathDirs = (process.env['PATH'] || '').split(path.delimiter).filter(Boolean);
+  for (const d of pathDirs) for (const name of ['chrome.exe', 'msedge.exe', 'brave.exe']) {
+    const c = path.join(d, name);
+    if (fs.existsSync(c)) return c;
+  }
+  throw new Error('Tidak menemukan Chrome / Edge / Brave di jalur standar maupun PATH. Instal salah satunya atau set DSWEB_BROWSER ke jalur exe-nya.');
 }
 
 function getFreePort() {
