@@ -77,7 +77,7 @@ export function apply(ctx, config) {
             for await (const ev of adapter.stream({ messages, tools, thinking: thinking || model === 'deepseek-reasoner', search, model })) {
               if (ev.type === 'text-delta') sendChunk({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: ev.text }, finish_reason: null }] });
               else if (ev.type === 'reasoning-delta') sendChunk({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: ev.text }, finish_reason: null }] });
-              else if (ev.type === 'tool-call-delta') { sawToolDelta = true; sendChunk({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: ev.id, type: 'function', function: { name: ev.name, arguments: ev.argumentsTextDelta } }] }, finish_reason: null }] });
+              else if (ev.type === 'tool-call-delta') { sawToolDelta = true; sendChunk({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: ev.id, type: 'function', function: { name: ev.name, arguments: ev.argumentsTextDelta } }] }, finish_reason: null }] }); }
               else if (ev.type === 'usage') streamUsage = ev;
             }
             const finish = { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: sawToolDelta ? 'tool_calls' : 'stop' }] };
