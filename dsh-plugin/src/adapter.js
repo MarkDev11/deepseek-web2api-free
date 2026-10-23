@@ -82,7 +82,8 @@ export class DsWebAdapter {
   }
   async *stream(options) {
     const opts = options || {};
-    const prompt = formatMessagesToPrompt(opts.messages || [], opts.tools || []);
+    let prompt = formatMessagesToPrompt(opts.messages || [], opts.tools || []);
+    if ((opts.tools || []).length) prompt += '\n\nREMINDER: To take an action, reply with ONLY the \uff5cDSML\uff5cfunction_calls block as your entire reply - never code, never prose. The tags are XML-like with a single |DSML| prefix on each tag.';
     const toolSchemas = new Map((opts.tools || []).map((tt) => { const f = tt.function || tt; return [f.name, f.parameters]; }));
     const emitArgs = (tc) => {
       let parsed = tc.parsedArguments;
