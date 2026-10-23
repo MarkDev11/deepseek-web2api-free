@@ -97,6 +97,9 @@ export class DsWebAdapter {
       const acct = await this.ensureAccount();
       const client = new WebClient(acct, { onCookies: (c) => this.store.updateCookies(acct.id, c) });
       const sieve = new DsmlStreamSieve();
+      const thinkSieve = new DsmlStreamSieve();
+      const seenCalls = new Set();
+      const callKey = (tc) => (tc.name || '') + '|' + JSON.stringify(tc.arguments || tc.raw || '');
       const thinkingOn = Boolean(opts.thinking) || opts.model === 'deepseek-reasoner';
       let outChars = 0;
       let sawTools = false;
@@ -104,17 +107,25 @@ export class DsWebAdapter {
       try {
         const sessionId = await client.createChatSession();
         for await (const ev of client.streamCompletion({ sessionId, prompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false })) {
-          if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true; yield { type: 'reasoning-delta', text: ev.delta }; }
+          if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
+            const tr = thinkSieve.feed(ev.delta);
+            if (tr.text) yield { type: 'reasoning-delta', text: tr.text };
+            for (const tc of tr.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
+          }
           else if (ev.type === 'text' && ev.delta) {
             if (DBG) DBG.write('X' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
             const r = sieve.feed(ev.delta);
             if (r.text) yield { type: 'text-delta', text: r.text };
-            for (const tc of r.toolCalls) { sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; }
+            for (const tc of r.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
           }
         }
         const tail = sieve.flush();
         if (tail.text) { yielded = true; yield { type: 'text-delta', text: tail.text }; }
-        for (const tc of tail.toolCalls) { sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; }
+        for (const tc of tail.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
+        const tailT = thinkSieve.flush();
+        if (tailT.text) { yielded = true; yield { type: 'reasoning-delta', text: tailT.text }; }
+        for (const tc of tailT.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
+        if (!yielded) { const ee = new Error('upstream returned an empty completion (no fragments; likely rate-limited)'); ee.code = 'RATE_LIMIT'; throw ee; }
         yield { type: 'block-end' };
         const inputTokens = Math.max(1, Math.ceil(prompt.length / 4));
         const outputTokens = Math.max(1, Math.ceil(outChars / 4));
@@ -127,7 +138,7 @@ export class DsWebAdapter {
         if (isMuted) this.store.markMuted(acct.id, e && e.muteUntil);
         if (isAuth) this.store.markQuarantined(acct.id, String(e && e.message || e));
         // akun mati/mute dan belum ada output -> coba akun lain (atau popup login) sekali
-        if ((isMuted || isAuth) && !yielded && attempt === 0) { lastErr = e; continue; }
+        if ((isMuted || isAuth || e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT') && !yielded && attempt === 0) { if (e.code === 'RATE_LIMIT') { await new Promise((rr) => setTimeout(rr, 6000)); } lastErr = e; continue; }
         throw e;
       }
     }

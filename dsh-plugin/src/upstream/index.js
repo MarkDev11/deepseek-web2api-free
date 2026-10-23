@@ -141,6 +141,30 @@ export async function* parseCompletionStream(body) {
       if (!ds || ds === '[DONE]') continue;
       let pkt;
       try { pkt = JSON.parse(ds); } catch { continue; }
+      // hint/toast dalam SSE: rate limit (freq) & mute — jangan biarkan lolos jadi 'kosong'
+      const hintObj = (pkt && typeof pkt.v === 'object' && pkt.v && !Array.isArray(pkt.v)) ? Object.assign({}, pkt, pkt.v) : pkt;
+      const bcode = hintObj.biz_code;
+      const bmsg = String(hintObj.biz_msg || hintObj.msg || '');
+      const fr = hintObj.finish_reason;
+      if (curEvent === 'hint' || bcode != null || (fr && fr !== 'stop') || hintObj.type === 'error') {
+        if (bcode === 5 || /muted|suspend/i.test(bmsg)) {
+          const e = new Error('user is muted');
+          e.code = 'USER_MUTED';
+          const mu = hintObj.mute_until;
+          e.muteUntil = mu ? mu * 1000 : Date.now() + 300000;
+          throw e;
+        }
+        if (bcode === 4 || fr === 'rate_limit_reached' || /频繁|frequent|too many/i.test(bmsg)) {
+          const e = new Error('rate limited (hint): ' + (bmsg || fr));
+          e.code = 'RATE_LIMIT';
+          throw e;
+        }
+        if (hintObj.type === 'error' && fr && fr !== 'stop') {
+          const e = new Error('upstream hint error: ' + (bmsg || fr));
+          e.code = 'UPSTREAM_HINT';
+          throw e;
+        }
+      }
       if (curEvent === 'ready' && pkt && pkt.response_message_id) {
         yield { type: 'meta', responseMessageId: pkt.response_message_id };
         continue;
