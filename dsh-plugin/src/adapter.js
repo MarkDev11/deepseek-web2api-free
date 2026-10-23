@@ -35,8 +35,24 @@ export function formatMessagesToPrompt(messages, tools) {
     else if (Array.isArray(msg.content)) text = msg.content.map((c) => (typeof c === 'string' ? c : (c && (c.text || c.content)) || JSON.stringify(c))).join('\n');
     else if (msg.content != null) text = JSON.stringify(msg.content);
     if (msg.role === 'system') parts.push('[System]\n' + text);
-    else if (msg.role === 'assistant') parts.push('[Assistant]\n' + text);
-    else if (msg.role === 'tool') parts.push('[Tool Result]\n' + text);
+    else if (msg.role === 'assistant') {
+      let t = text;
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+        const calls = msg.tool_calls.map((tc) => {
+          const fn = tc.function || {};
+          let args = {};
+          try { args = typeof fn.arguments === 'string' ? JSON.parse(fn.arguments) : (fn.arguments || {}); } catch { args = {}; }
+          const params = Object.keys(args).map((k) => {
+            const v = args[k];
+            return '<｜DSML｜parameter name="' + k + '" string="true">' + (typeof v === 'string' ? v : JSON.stringify(v)) + '</｜DSML｜parameter>';
+          }).join('');
+          return '<｜DSML｜invoke name="' + (fn.name || 'unknown') + '">' + params + '</｜DSML｜invoke>';
+        }).join('');
+        t = (text ? text + '\n' : '') + '<｜DSML｜function_calls>' + calls + '</｜DSML｜function_calls>';
+      }
+      parts.push('[Assistant]\n' + t);
+    }
+    else if (msg.role === 'tool') parts.push('[Tool Result' + (msg.name ? ' of tool "' + msg.name + '"' : '') + ']\n' + text);
     else parts.push('[User]\n' + text);
   }
   return parts.join('\n\n');
