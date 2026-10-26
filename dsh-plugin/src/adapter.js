@@ -318,7 +318,8 @@ export class DsWebAdapter {
         if (isAuth) this.store.removeAccount(acct.id); // token mati tak bisa pulih sendiri: hapus saja
         // akun mati/mute dan belum ada output -> coba akun lain (atau popup login) sekali
         if (!yielded && (isMuted || isAuth) && attempt === 0) { lastErr = e; continue; }
-        if (!yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT' || e.code === 'UPSTREAM_TIMEOUT') && attempt < 2) { const waitMs = e.code === 'RATE_LIMIT' ? 6000 : (attempt === 0 ? 5000 : 15000); await new Promise((rr) => setTimeout(rr, waitMs)); lastErr = e; continue; }
+        if (sess && sess.sessionId && e.code === 'UPSTREAM_PARENT') { this.sessions.delete(this.keyFor(acct, opts)); this.lastUsedAt.set(this.keyFor(acct, opts), Date.now() + this.keepAliveTtlMs); void client.deleteSession(sess.sessionId); sess.parentId = null; sess.sessionId = null; } // parent ditolak = sesi beracun: buang sebelum retry
+        if (!yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT' || e.code === 'UPSTREAM_TIMEOUT' || e.code === 'UPSTREAM_PARENT') && attempt < 2) { const waitMs = e.code === 'UPSTREAM_PARENT' ? 0 : (e.code === 'RATE_LIMIT' ? 6000 : (attempt === 0 ? 5000 : 15000)); await new Promise((rr) => setTimeout(rr, waitMs)); lastErr = e; continue; }
         if (sess && sess.sessionId && !yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT')) { this.sessions.delete(this.keyFor(acct, opts)); this.lastUsedAt.set(this.keyFor(acct, opts), Date.now() + this.keepAliveTtlMs); void client.deleteSession(sess.sessionId); }
         throw e;
       }

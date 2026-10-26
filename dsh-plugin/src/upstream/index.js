@@ -117,6 +117,11 @@ export class WebClient {
         e.muteUntil = d.mute_until ? d.mute_until * 1000 : Date.now() + 300000;
         throw e;
       }
+      if (d && (d.biz_code === 26 || /invalid message id/i.test(String(d.biz_msg || '')))) {
+        const e = new Error('upstream rejected parent message id (session tip lost)');
+        e.code = 'UPSTREAM_PARENT';
+        throw e;
+      }
       if (d && d.biz_code === 4 && String(d.biz_msg || '').indexOf('频繁') !== -1) {
         const e = new Error('rate limited (hint)');
         e.code = 'RATE_LIMIT';
