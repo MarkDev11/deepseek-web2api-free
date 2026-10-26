@@ -1,6 +1,7 @@
 import { AccountStore, launchOAuthPopupCapture } from './capture/index.js';
 import { WebClient } from './upstream/index.js';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { buildToolSystemPrompt, DsmlStreamSieve } from './dsml.js';
 const DBG = process.env.DSWEB_DEBUG ? fs.createWriteStream(process.env.DSWEB_DEBUG, { flags: 'a' }) : null;
 
@@ -76,14 +77,21 @@ export class DsWebAdapter {
     ];
   }
   keyFor(acct, opts) {
-    return acct.id + '|' + (opts && (opts.model || 'deepseek-chat')) + ((opts && opts.sessionKey != null) ? '|' + opts.sessionKey : '');
+    const msgs = (opts && opts.messages) || [];
+    let seed = '';
+    for (const m of msgs.slice(0, 1)) {
+      const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+      seed += (m.role || '') + ':' + c.slice(0, 200) + '\n';
+    }
+    const fp = createHash('sha256').update(seed).digest('hex').slice(0, 16);
+    return acct.id + '|' + ((opts && opts.model) || 'deepseek-chat') + '|' + fp;
   }
   async sessionFor(acct, opts) {
     const k = this.keyFor(acct, opts);
     const s = this.sessions.get(k);
     if (s && s.sessionId) { this.lastUsedAt.delete(k); s.reused = true; return s; }
     this.lastUsedAt.delete(k);
-    return { sessionId: null, parentId: null, reused: false, at: 0 };
+    return { sessionId: null, parentId: null, reused: false, core: null, at: 0 };
   }
   async ensureAccount() {
     let acct = this.store.acquireNext();
@@ -95,7 +103,8 @@ export class DsWebAdapter {
   }
   async *stream(options) {
     const opts = options || {};
-    let prompt = formatMessagesToPrompt(opts.messages || [], opts.tools || []);
+    const corePrompt = formatMessagesToPrompt(opts.messages || [], opts.tools || []);
+    let prompt = corePrompt;
     if ((opts.tools || []).length) prompt += '\n\nREMINDER: To take an action, reply with ONLY the \uff5cDSML\uff5cfunction_calls block as your entire reply - never code, never prose. The tags are XML-like with a single |DSML| prefix on each tag.';
     const toolSchemas = new Map((opts.tools || []).map((tt) => { const f = tt.function || tt; return [f.name, f.parameters]; }));
     const emitArgs = (tc) => {
@@ -120,12 +129,22 @@ export class DsWebAdapter {
       let yielded = false;
       try {
         sess = await this.sessionFor(acct, opts);
+        let sendPrompt = prompt;
+        if (sess.sessionId && sess.core != null) {
+          if (corePrompt === sess.core) {
+            sendPrompt = prompt; // riwayat identik -> ulang pertanyaan yang sama
+          } else if (corePrompt.startsWith(sess.core)) {
+            sendPrompt = corePrompt.slice(sess.core.length) + prompt.slice(corePrompt.length); // riwayat memanjang -> kirim ekor saja
+            sess.reused = true;
+          } else {
+            sendPrompt = prompt; // riwayat menyimpang (edit/regenerate) -> sesi sama, prompt penuh (semantik edit pesan)
+          }
+        }
         const sessionId = sess.sessionId || (await client.createChatSession());
         if (!sess.sessionId) { sess.sessionId = sessionId; this.sessions.set(this.keyFor(acct, opts), sess); }
-        sess.prompt = prompt;
         let curParent = sess.parentId || null;
         let nEvents = 0;
-        for await (const ev of client.streamCompletion({ sessionId, prompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent })) {
+        for await (const ev of client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent })) {
           if (ev.type === 'meta' && ev.responseMessageId) { curParent = ev.responseMessageId; sess.parentId = curParent; sess.at = Date.now(); nEvents++; continue; }
           if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
             const tr = thinkSieve.feed(ev.delta);
@@ -158,11 +177,13 @@ export class DsWebAdapter {
               else if (e2.type === 'text' && e2.delta) { n2++; yield { type: 'text-delta', text: e2.delta }; }
             }
             sess.sessionId = sid2;
-            sess.prompt = prompt;
+            sess.core = corePrompt;
             sess.at = Date.now();
             if (!n2) { const ee2 = new Error('upstream returned an empty completion (no fragments; likely rate-limited)'); ee2.code = 'RATE_LIMIT'; throw ee2; }
           } else { const ee = new Error('upstream returned an empty completion (no fragments; likely rate-limited)'); ee.code = 'RATE_LIMIT'; throw ee; }
         }
+        sess.core = corePrompt;
+        sess.at = Date.now();
         yield { type: 'block-end' };
         const inputTokens = Math.max(1, Math.ceil(prompt.length / 4));
         const outputTokens = Math.max(1, Math.ceil(outChars / 4));
