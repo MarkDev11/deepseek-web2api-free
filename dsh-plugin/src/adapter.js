@@ -61,6 +61,29 @@ export function formatMessagesToPrompt(messages, tools) {
   return parts.join('\n\n');
 }
 
+function normSearch(s) { return s.replace(/FINISHED/g, '').replace(/\[citation:(\d+)\]/g, '[$1]'); }
+export class SearchStripper {
+  constructor(enabled) { this.on = Boolean(enabled); this.head = ''; this.done = !this.on; }
+  feed(text) {
+    if (!this.on) return text || '';
+    let out;
+    if (!this.done) {
+      this.head += text || '';
+      if (this.head.length < 12) return '';
+      out = this.head.replace(/^(?:WEB_SEARCH|SEARCHING|SEARCH)[ \t]*\r?\n?/i, '');
+      this.head = ''; this.done = true;
+    } else { out = text || ''; }
+    return normSearch(out);
+  }
+  flush() {
+    if (!this.on || this.done) return '';
+    this.done = true;
+    const out = this.head.replace(/^(?:WEB_SEARCH|SEARCHING|SEARCH)[ \t]*\r?\n?/i, '');
+    this.head = '';
+    return normSearch(out);
+  }
+}
+
 export class DsWebAdapter {
   constructor(options) {
     const o = options || {};
@@ -121,6 +144,7 @@ export class DsWebAdapter {
       const client = new WebClient(acct, { onCookies: (c) => this.store.updateCookies(acct.id, c) });
       const sieve = new DsmlStreamSieve();
       const thinkSieve = new DsmlStreamSieve();
+      const searchStrip = new SearchStripper(opts.search !== false);
       const seenCalls = new Set();
       const callKey = (tc) => (tc.name || '') + '|' + JSON.stringify(tc.arguments || tc.raw || '');
       const thinkingOn = Boolean(opts.thinking) || opts.model === 'deepseek-reasoner';
@@ -141,7 +165,7 @@ export class DsWebAdapter {
           }
         }
         const sessionId = sess.sessionId || (await client.createChatSession());
-        if (!sess.sessionId) { sess.sessionId = sessionId; this.sessions.set(this.keyFor(acct, opts), sess); }
+        if (!sess.sessionId) { sess.sessionId = sessionId; if (this.sessions.size >= 100) { let oldestKey = null; let oldest = Infinity; for (const [kOld, vOld] of this.sessions) { const atOld = vOld && typeof vOld.at === 'number' ? vOld.at : 0; if (atOld < oldest) { oldest = atOld; oldestKey = kOld; } } if (oldestKey) this.sessions.delete(oldestKey); } this.sessions.set(this.keyFor(acct, opts), sess); }
         let curParent = sess.parentId || null;
         let nEvents = 0;
         for await (const ev of client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent })) {
@@ -154,12 +178,14 @@ export class DsWebAdapter {
           else if (ev.type === 'text' && ev.delta) {
             if (DBG) DBG.write('X' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
             const r = sieve.feed(ev.delta);
-            if (r.text) yield { type: 'text-delta', text: r.text };
+            const sTxt = searchStrip.feed(r.text || '');
+            if (sTxt) yield { type: 'text-delta', text: sTxt };
             for (const tc of r.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
           }
         }
         const tail = sieve.flush();
-        if (tail.text) { yielded = true; yield { type: 'text-delta', text: tail.text }; }
+        const sTail = searchStrip.feed((tail && tail.text) || '') + searchStrip.flush();
+        if (sTail) { yielded = true; yield { type: 'text-delta', text: sTail }; }
         for (const tc of tail.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
         const tailT = thinkSieve.flush();
         if (tailT.text) { yielded = true; yield { type: 'reasoning-delta', text: tailT.text }; }
@@ -169,6 +195,7 @@ export class DsWebAdapter {
             // sesi lama diabaikan upstream -> buka satu sesi baru (tetap satu sesi per percakapan)
             sess.reused = false;
             sess.parentId = null;
+            if (sess.sessionId) { void client.deleteSession(sess.sessionId); }
             const sid2 = await client.createChatSession();
             let n2 = 0;
             for await (const e2 of client.streamCompletion({ sessionId: sid2, prompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: null })) {
@@ -197,8 +224,8 @@ export class DsWebAdapter {
         if (isAuth) this.store.removeAccount(acct.id); // token mati tak bisa pulih sendiri: hapus saja
         // akun mati/mute dan belum ada output -> coba akun lain (atau popup login) sekali
         if (!yielded && (isMuted || isAuth) && attempt === 0) { lastErr = e; continue; }
-        if (!yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT') && attempt < 2) { const waitMs = e.code === 'RATE_LIMIT' ? 6000 : (attempt === 0 ? 5000 : 15000); await new Promise((rr) => setTimeout(rr, waitMs)); lastErr = e; continue; }
-        if (sess && sess.sessionId && !yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT')) { this.sessions.delete(this.keyFor(acct, opts)); this.lastUsedAt.set(this.keyFor(acct, opts), Date.now() + this.keepAliveTtlMs); }
+        if (!yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT' || e.code === 'UPSTREAM_TIMEOUT') && attempt < 2) { const waitMs = e.code === 'RATE_LIMIT' ? 6000 : (attempt === 0 ? 5000 : 15000); await new Promise((rr) => setTimeout(rr, waitMs)); lastErr = e; continue; }
+        if (sess && sess.sessionId && !yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT')) { this.sessions.delete(this.keyFor(acct, opts)); this.lastUsedAt.set(this.keyFor(acct, opts), Date.now() + this.keepAliveTtlMs); void client.deleteSession(sess.sessionId); }
         throw e;
       }
     }

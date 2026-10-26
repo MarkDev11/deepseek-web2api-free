@@ -46,14 +46,19 @@ export class WebClient {
       }
     } catch {}
   }
-  async _post(path, body, extra) {
+  async _post(path, body, extra, fetchOpts) {
     const res = await this.fetchImpl(this.baseUrl + path, {
       method: 'POST',
       headers: buildFingerprintHeaders(this.token, this.cookies, extra),
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: (fetchOpts && fetchOpts.signal) || undefined
     });
     this._captureCookies(res);
     return res;
+  }
+  async deleteSession(sessionId) {
+    if (!sessionId) return false;
+    try { await this._post('/api/v0/chat_session/delete', { chat_session_id: sessionId }); return true; } catch { return false; }
   }
   static _authFail(data) {
     if (data && (data.code === 40003 || String(data.msg || '').toLowerCase().indexOf('authorization failed') !== -1)) {
@@ -84,15 +89,21 @@ export class WebClient {
   async *streamCompletion(opts) {
     const ch = await this.createPowChallenge();
     const pow = await buildPowHeader(ch);
-    const res = await this._post('/api/v0/chat/completion', {
-      chat_session_id: opts.sessionId,
-      parent_message_id: opts.parentMessageId || null,
-      prompt: opts.prompt,
-      ref_file_ids: [],
-      thinking_enabled: Boolean(opts.thinkingEnabled),
-      search_enabled: Boolean(opts.searchEnabled),
-      preempt: false
-    }, { 'x-ds-pow-response': pow, 'accept': 'text/event-stream' });
+    let res;
+    try {
+      res = await this._post('/api/v0/chat/completion', {
+        chat_session_id: opts.sessionId,
+        parent_message_id: opts.parentMessageId || null,
+        prompt: opts.prompt,
+        ref_file_ids: [],
+        thinking_enabled: Boolean(opts.thinkingEnabled),
+        search_enabled: Boolean(opts.searchEnabled),
+        preempt: false
+      }, { 'x-ds-pow-response': pow, 'accept': 'text/event-stream' }, { signal: AbortSignal.timeout(600000) });
+    } catch (e) {
+      if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) { const te = new Error('upstream request timed out'); te.code = 'UPSTREAM_TIMEOUT'; throw te; }
+      throw e;
+    }
     this._captureCookies(res);
 
     const ct = res.headers.get('content-type') || '';
