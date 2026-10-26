@@ -32,6 +32,7 @@ export function buildToolSystemPrompt(tools) {
 export function normalizeDsml(text) {
   if (!text) return text;
   return text
+    .replace(new RegExp('(?<![<\\/｜|])\\/?\\s*' + P + '{1,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|function_calls)\\s*>', 'gi'), '</\uff5cDSML\uff5c$1>')
     .replace(new RegExp('<\\/\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|function_calls)\\s*>', 'gi'), '</\uff5cDSML\uff5c$1>')
     .replace(/<\/\s*(invoke|parameter)\s*>/gi, '</\uff5cDSML\uff5c$1>')
     .replace(new RegExp('<\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|function_calls)', 'gi'), '<\uff5cDSML\uff5c$1')
@@ -51,7 +52,7 @@ export function parseDsmlToolCalls(text) {
     const args = {};
     let pm;
     paramRe.lastIndex = 0;
-    while ((pm = paramRe.exec(m[2])) !== null) args[pm[1]] = pm[2];
+    while ((pm = paramRe.exec(m[2])) !== null) args[pm[1]] = pm[2].replace(TRUNC_ANY_RE, '');
     calls.push({ id: 'call_' + crypto.randomBytes(8).toString('hex'), name: m[1], arguments: JSON.stringify(args), parsedArguments: args });
   }
   return calls;
