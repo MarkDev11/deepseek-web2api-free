@@ -282,7 +282,7 @@ export class DsWebAdapter {
         if (!sawTools && !nudged && curParent && (sawTruncated || thinkOnly || (withTools && new RegExp('\\b(I\'?ll|I will|Let me|Now I|Now, let|First,? I|Next,? I|Then I|I need to|I must|Sekarang saya|akan saya|biar saya|perlu saya|Saya\\s+(?:akan\\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau)|aku\\s+(?:akan\\s+)?(?:tambahkan|cek|coba|mau))\\b', 'i').test(partialAll)))) {
           nudged = true;
           const beforeN = callsEmitted;
-          const maxRounds = thinkOnly ? 2 : 1;
+          const maxRounds = 2;
           let forceNoThink = false;
           let nbuf = [];
           let ntxt = '';
@@ -291,12 +291,15 @@ export class DsWebAdapter {
             nudgePass = true;
             nbuf = [];
             const nPrompt = (thinkOnly
-              ? ('Your previous response contained reasoning only, with no answer. Continue now: ' + (withTools ? 'emit ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '") or write your actual answer text.' : 'write your actual answer text now.') + ' Never reply with reasoning only.')
-              : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE.'))
+              ? ('Your previous response contained reasoning only, with no answer. Continue now: ' + (withTools ? 'emit ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '") or write your actual answer text.' : 'write your actual answer text now.') + ' Never reply with reasoning only. Never reply with just the _nonce value by itself, it is not an answer.')
+              : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE. Never reply with just the _nonce value by itself.'))
               + (forceNoThink ? ' Reply with final content only, no reasoning.' : '');
             for await (const ev of consume(client.streamCompletion({ sessionId, prompt: nPrompt, thinkingEnabled: forceNoThink ? false : thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false)) nbuf.push(ev);
             ntxt = nbuf.filter((e) => e.type === 'text-delta').map((e) => e.text).join('').trim();
+            if (ntxt && ntxt === String(nonce)) { if (DBG) DBG.write('DROP bare-nonce' + String.fromCharCode(10)); ntxt = ''; }
+            else if (ntxt) ntxt = ntxt.replace(new RegExp('(?:' + String.fromCharCode(92) + 'r?' + String.fromCharCode(92) + 'n)+' + String.fromCharCode(92) + 's*' + nonce + String.fromCharCode(92) + 's*$'), '').trim();
             if (callsEmitted > beforeN || (ntxt && !/^DONE\b/i.test(ntxt))) break;
+            if (/^DONE\b/i.test(ntxt)) break;
             forceNoThink = true;
           }
           nudgePass = false;

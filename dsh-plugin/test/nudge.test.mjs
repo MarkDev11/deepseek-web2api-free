@@ -105,5 +105,25 @@ async function run(gen) {
   assert.equal(r8.tool, JSON.stringify({ q: 'halo' }), 'nonce salah harus tetap diterima di nud: ' + r8.tool);
 }
 
+// 9) ronde nud membalas nonce telanjang -> diabaikan; ronde 2 (thinking OFF) harus jawab
+{
+  const fixed = (0.777).toString(36).slice(2, 10);
+  const asliRandom = Math.random;
+  Math.random = () => 0.777;
+  let r9;
+  try {
+    r9 = await run(async function* (n) {
+      yield { type: 'meta', responseMessageId: 17 };
+      if (n === 1) { yield { type: 'text', delta: 'Sekarang saya ganti UI daftar token.' }; return; }
+      if (n === 2) { yield { type: 'text', delta: fixed }; return; }
+      yield { type: 'text', delta: 'Sudah saya ganti dan rebuild.' };
+    });
+  } finally { Math.random = asliRandom; }
+  assert.equal(r9.reqs.length, 3, 'nonce telanjang bukan jawaban: ' + r9.reqs.length);
+  assert.equal(r9.thinks[2], false, 'ronde 3 thinking OFF');
+  assert.ok(r9.out.includes('Sudah saya ganti'), r9.out);
+  assert.ok(!r9.out.includes(fixed), 'nonce tak boleh bocor: ' + r9.out);
+}
+
 U.WebClient.prototype.createChatSession = asli;
 console.log('OK nudge');
