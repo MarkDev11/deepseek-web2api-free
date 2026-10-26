@@ -5,8 +5,13 @@ import { createHash } from 'node:crypto';
 import { buildToolSystemPrompt, DsmlStreamSieve } from './dsml.js';
 const DBG_PATH = process.env.DSWEB_DEBUG !== undefined ? process.env.DSWEB_DEBUG : 'E:\\TESTING\\deepseekapi\\dsweb-debug.log';
 const DBG = DBG_PATH && DBG_PATH !== '0' ? fs.createWriteStream(DBG_PATH, { flags: 'a' }) : null;
+const dw = (s) => { if (DBG) DBG.write(new Date().toISOString().slice(11, 23) + ' ' + s); };
 const STALL_FIRST = Number(process.env.DSWEB_STALL_FIRST_MS || 40000);
 const STALL_IDLE = Number(process.env.DSWEB_STALL_IDLE_MS || 10000);
+function makeSem(max) { let n = 0; const q = []; return {
+  a() { if (n < max) { n++; return Promise.resolve(); } return new Promise((r) => q.push(r)); },
+  r() { const w = q.shift(); if (w) w(); else n--; }
+}; }
 function guard(iter, firstMs, idleMs) {
   let gotFirst = false;
   return (async function* () {
@@ -99,7 +104,8 @@ export function looksLikeToolIntent(text) {
 }
 export function plansMoreAction(text) {
   const t = String(text || '');
-  return /\b(I'?ll|I will|let me|now I|going to|first,? I|next,? I|then I|I need to|I must|sekarang saya|sedang saya|akan saya|saya akan|akan ku[a-z]+|biar saya|perlu saya|saya\s+(?:akan\s+|sedang\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau|terapkan|perbaiki)|aku\s+(?:akan\s+)?(?:tambahkan|cek|coba|mau))\b/i.test(t);
+  if (/(sudah|telah|selesai|\bdone\b|\balready\b|\bcompleted\b)/i.test(t)) return false;
+  return /\b(I'?ll|I will|let me|now I|going to|gonna|i am going|i'?d better|first,? I|next,? I|then I|I need to|I must|sekarang saya|sedang saya|akan saya|saya akan|akan ku[a-z]+|biar saya|perlu saya|saya\s+(?:akan\s+|sedang\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau|terapkan|perbaiki|lanjutkan|baca|telusuri|lacak|uji|ganti|siapkan)|aku\s+(?:akan\s+)?(?:tambahkan|cek|coba|mau))\b/i.test(t);
 }
 
 export function checkToolNonce(parsed, nonce) {
@@ -187,6 +193,8 @@ export class DsWebAdapter {
     for (let attempt = 0; attempt < 3; attempt++) {
       const acct = await this.ensureAccount();
       const client = new WebClient(acct, { onCookies: (c) => this.store.updateCookies(acct.id, c) });
+      const sem = this._upSem || (this._upSem = makeSem(Number(process.env.DSWEB_MAX_CONCURRENCY || 1)));
+      const slot = (it) => (async function* () { await sem.a(); try { yield* it; } finally { sem.r(); } })();
       const sieve = new DsmlStreamSieve();
       const thinkSieve = new DsmlStreamSieve();
       const searchStrip = new SearchStripper(opts.search !== false);
@@ -226,12 +234,12 @@ export class DsWebAdapter {
         let nudgePass = false;
         function* emitCall(tc) {
           const k = callKey(tc);
-          if (seenCalls.has(k) && !nudgePass) { if (DBG) DBG.write('DROP dup ' + String(k).slice(0, 80) + '\n'); return; }
+          if (seenCalls.has(k) && !nudgePass) { dw('DROP dup ' + String(k).slice(0, 80) + '\n'); return; }
           let parsed = tc.parsedArguments;
           if (!parsed) { try { parsed = JSON.parse(tc.arguments || '{}'); } catch { parsed = null; } }
           let chk = checkToolNonce(parsed, nonce);
-          if (!chk.ok && nudgePass) { if (DBG) DBG.write('KEEP nonce-mismatch(nudge) ' + String(tc.name) + '\n'); const kept = Object.assign({}, chk.parsed); delete kept._nonce; chk = { ok: true, parsed: kept }; }
-          if (!chk.ok) { if (DBG) DBG.write('DROP nonce ' + String(tc.name) + '\n'); return; }
+          if (!chk.ok && nudgePass) { dw('KEEP nonce-mismatch(nudge) ' + String(tc.name) + '\n'); const kept = Object.assign({}, chk.parsed); delete kept._nonce; chk = { ok: true, parsed: kept }; }
+          if (!chk.ok) { dw('DROP nonce ' + String(tc.name) + '\n'); return; }
           seenCalls.add(k); sawTools = true; callsEmitted++;
           const coerced = coerceToolArgs(chk.parsed, toolSchemas.get(tc.name));
           yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: JSON.stringify(coerced ?? {}) };
@@ -249,13 +257,13 @@ export class DsWebAdapter {
         async function* consume(iter, gated) {
           for await (const ev of iter) {
             if (ev.type === 'meta' && ev.responseMessageId) { curParent = ev.responseMessageId; sess.parentId = curParent; sess.at = Date.now(); nEvents++; continue; }
-            if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true; hadThinking = true;
+            if (ev.type === 'thinking' && ev.delta) { dw('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true; hadThinking = true;
               const tr = thinkSieve.feed(ev.delta);
               if (tr.text) yield { type: 'reasoning-delta', text: tr.text };
               for (const tc of tr.toolCalls) yield* emitCall(tc);
             }
             else if (ev.type === 'text' && ev.delta) {
-              if (DBG) DBG.write('X' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
+              dw('X' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
               const r = sieve.feed(ev.delta);
               partialAll += (r.text || '');
               const st = searchStrip.feed(r.text || '');
@@ -278,8 +286,8 @@ export class DsWebAdapter {
         }
         let midErr = null;
         try {
-          if (DBG) DBG.write('REQ1 n=' + sendPrompt.length + ' parent=' + (curParent || 'null') + ' tools=' + ((opts.tools || []).length) + '\n');
-          try { yield* consume(guard(client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE), true); } catch (se) { if (se && se.code === 'UPSTREAM_STALL') { if (DBG) DBG.write('STALL mid-stream' + String.fromCharCode(10)); sawTruncated = true; } else throw se; }
+          dw('REQ1 n=' + sendPrompt.length + ' parent=' + (curParent || 'null') + ' tools=' + ((opts.tools || []).length) + '\n');
+          try { yield* consume(slot(guard(client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE)), true); } catch (se) { if (se && se.code === 'UPSTREAM_STALL') { dw('STALL mid-stream' + String.fromCharCode(10)); sawTruncated = true; } else throw se; }
         } catch (eMid) {
           const contable = eMid && (eMid.code === 'UPSTREAM_HINT' || eMid.code === 'RATE_LIMIT' || eMid.code === 'UPSTREAM_TIMEOUT') && yielded && !sawTools && !continuationDone && curParent;
           if (!contable) throw eMid;
@@ -292,7 +300,7 @@ export class DsWebAdapter {
           const contPrompt = 'Your previous response was cut short by a server error after this text: \"\"\"' + sofar + '\"\"\". Continue from exactly that point, in the same language, without repeating any of it and without starting over.';
           const evB4C = nEvents;
           try {
-            yield* consume(guard(client.streamCompletion({ sessionId, prompt: contPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE), false);
+            yield* consume(slot(guard(client.streamCompletion({ sessionId, prompt: contPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE)), false);
           } catch (eCont) { throw midErr; }
           if (nEvents !== evB4C) continued = true;
           else { throw midErr; }
@@ -302,7 +310,7 @@ export class DsWebAdapter {
           const evBefore = nEvents;
           gate.mode = 'open';
           const repairNote = 'Your previous response tried to call a tool but the envelope was invalid. Reply again with ONLY the \uff5cDSML\uff5cfunction_calls block for the next action, including the "_nonce" parameter set to "' + nonce + '". No prose, no JSON.';
-          yield* consume(guard(client.streamCompletion({ sessionId, prompt: repairNote, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE), false);
+          yield* consume(slot(guard(client.streamCompletion({ sessionId, prompt: repairNote, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE)), false);
           if (nEvents === evBefore) { yielded = true; yield { type: 'text-delta', text: held }; }
         } else if (held && !continued) { yielded = true; yield { type: 'text-delta', text: held }; }
         const thinkOnly = !partialAll && hadThinking && !sawTools;
@@ -316,7 +324,7 @@ export class DsWebAdapter {
           let ntxt = '';
           while (attempts < 5) {
             attempts++;
-            if (DBG) DBG.write('NUDGE r' + attempts + ' thinkOnly=' + thinkOnly + ' trunc=' + sawTruncated + '\n');
+            dw('NUDGE r' + attempts + ' thinkOnly=' + thinkOnly + ' trunc=' + sawTruncated + '\n');
             nudgePass = true;
             nbuf = [];
             const nPrompt = (thinkOnly
@@ -324,22 +332,22 @@ export class DsWebAdapter {
               : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete ｜DSML｜function_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE. Never reply with just the _nonce value by itself.'))
               + (forceNoThink ? ' Reply with final content only, no reasoning.' : '')
               + (nr >= 2 ? ' You replied with a plan already. Do NOT write another plan sentence: reply with ONLY the tool block now, or DONE.' : '');
-            for await (const ev of consume(guard(client.streamCompletion({ sessionId, prompt: nPrompt, thinkingEnabled: forceNoThink ? false : thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE), false)) nbuf.push(ev);
+            try { for await (const ev of consume(slot(guard(client.streamCompletion({ sessionId, prompt: nPrompt, thinkingEnabled: forceNoThink ? false : thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE)), false)) nbuf.push(ev); } catch (ne) { if (ne && ne.code === 'UPSTREAM_STALL') { dw('NUDGE stall-round\n'); nbuf = []; } else throw ne; }
             const rawNtxt = nbuf.filter((e) => e.type === 'text-delta').map((e) => e.text).join('').trim();
             ntxt = rawNtxt;
-            if (ntxt && ntxt === String(nonce)) { if (DBG) DBG.write('DROP bare-nonce' + String.fromCharCode(10)); ntxt = ''; }
+            if (ntxt && ntxt === String(nonce)) { dw('DROP bare-nonce' + String.fromCharCode(10)); ntxt = ''; }
             else if (ntxt) ntxt = ntxt.replace(new RegExp('(?:' + String.fromCharCode(92) + 'r?' + String.fromCharCode(92) + 'n)+' + String.fromCharCode(92) + 's*' + nonce + String.fromCharCode(92) + 's*$'), '').trim();
             if (callsEmitted > beforeN) break;
             if (/^DONE\b/i.test(ntxt)) break;
             const planAgain = ntxt && plansMoreAction(ntxt);
             if (ntxt && !planAgain) break;
-            if (planAgain && DBG) DBG.write('NUDGE plan-prose diabaikan' + String.fromCharCode(10));
+            if (planAgain) dw('NUDGE plan-prose diabaikan\n');
             const nAct = Boolean(rawNtxt) || nbuf.some((e) => e.type === 'reasoning-delta' || e.type === 'tool-call-delta');
-            if (!ntxt && !nAct && emptyStreak < 1) { emptyStreak++; if (DBG) DBG.write('NUDGE empty-retry' + String.fromCharCode(10)); continue; }
+            if (!ntxt && !nAct && emptyStreak < 1) { emptyStreak++; dw('NUDGE empty-retry' + String.fromCharCode(10)); continue; }
             emptyStreak = 0; nr++; forceNoThink = true;
           }
           nudgePass = false;
-          if (DBG) DBG.write('NUDGE_END calls=' + (callsEmitted - beforeN) + ' txt=' + ntxt.length + '\n');
+          dw('NUDGE_END calls=' + (callsEmitted - beforeN) + ' txt=' + ntxt.length + '\n');
           if (callsEmitted > beforeN) { for (const ev of nbuf) yield ev; }
           else if (ntxt && !/^DONE\b/i.test(ntxt)) { yielded = true; yield { type: 'text-delta', text: ntxt }; }
         }
@@ -371,7 +379,7 @@ export class DsWebAdapter {
         yield { type: 'finish', reason: { kind: sawTools ? 'tool-calls' : 'stop' } };
         return;
       } catch (e) {
-        if (DBG) DBG.write('ERR ' + String((e && (e.code || e.message)) || e) + '\n');
+        dw('ERR ' + String((e && (e.code || e.message)) || e) + '\n');
         const isMuted = e && (e.code === 'USER_MUTED' || /muted|suspend/i.test(String(e && e.message || '')));
         const isAuth = e && (e.code === 40003 || /invalid token|authorization failed/i.test(String(e && e.message || '')));
         if (isMuted) this.store.markMuted(acct.id, e && e.muteUntil);
