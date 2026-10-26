@@ -11,6 +11,11 @@ assert.ok(!plansMoreAction('Selesai, semuanya sudah beres.'), 'selesai bukan ren
 assert.ok(!plansMoreAction('Fiturnya ada di file config.'), 'netral bukan rencana');
 assert.ok(plansMoreAction('Interface sudah lengkap. Sekarang saya tulis provider host.'), 'klausa netral tak membunuh klausa rencana');
 assert.ok(plansMoreAction('Sudah selesai bagian A. Saya cek bagian B dulu.'), 'rencana pasca-selesai tetap rencana');
+import { shortOpenish } from '../src/adapter.js';
+assert.ok(shortOpenish('Perbaikan masuk dan build bersih. Sekarang restart dan buktikan tidak ada proses yatim lagi.'), 'kalimat kerja pendek = terbuka');
+assert.ok(!shortOpenish('Sudah selesai semua kok.'), 'penyangkal lampau = final');
+assert.ok(!shortOpenish('X'.repeat(221)), 'panjang = jawaban utuh');
+
 // H3: upstream hanya boleh 1-in-flight per adapter
 function mk() {
   const a = new DsWebAdapter({ storePath: (process.env.TEMP || '.') + '/dsweb-test-harden.json' });

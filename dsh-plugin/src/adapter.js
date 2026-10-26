@@ -104,6 +104,11 @@ export function looksLikeToolIntent(text) {
 }
 const PLAN_NEG = /(sudah|telah|selesai|\bdone\b|\balready\b|\bcompleted\b)/i;
 const PLAN_PAT = /\b(I'?ll|I will|let me|now I|going to|gonna|i am going|i'?d better|first,? I|next,? I|then I|I need to|I must|sekarang saya|sedang saya|akan saya|saya akan|akan ku[a-z]+|biar saya|perlu saya|saya\s+(?:akan\s+|sedang\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau|terapkan|perbaiki|lanjutkan|baca|telusuri|lacak|uji|ganti|siapkan)|aku\s+(?:akan\s+)?(?:tambahkan|cek|coba|mau))\b/i;
+export function shortOpenish(text) {
+  const t = String(text || '').trim();
+  return t.length > 0 && t.length <= 220 && !PLAN_NEG.test(t);
+}
+
 export function plansMoreAction(text) {
   const t = String(text || '');
   return t.split(/[.;!?\n]+/).some((cl) => PLAN_PAT.test(cl) && !PLAN_NEG.test(cl));
@@ -236,6 +241,7 @@ export class DsWebAdapter {
         function* emitCall(tc) {
           const k = callKey(tc);
           if (seenCalls.has(k) && !nudgePass) { dw('DROP dup ' + String(k).slice(0, 80) + '\n'); return; }
+          if (!tc.name || !toolSchemas.has(String(tc.name))) { dw('DROP unknown ' + String(tc.name) + '\n'); sawTruncated = true; return; }
           let parsed = tc.parsedArguments;
           if (!parsed) { try { parsed = JSON.parse(tc.arguments || '{}'); } catch { parsed = null; } }
           let chk = checkToolNonce(parsed, nonce);
@@ -316,7 +322,7 @@ export class DsWebAdapter {
         } else if (held && !continued) { yielded = true; yield { type: 'text-delta', text: held }; }
         const thinkOnly = !partialAll && hadThinking && !sawTools;
         const withTools = (opts.tools || []).length > 0;
-        if (!sawTools && !nudged && curParent && (sawTruncated || thinkOnly || (withTools && plansMoreAction(partialAll)))) {
+        if (!sawTools && !nudged && curParent && (sawTruncated || thinkOnly || (withTools && (plansMoreAction(partialAll) || shortOpenish(partialAll))))) {
           nudged = true;
           const beforeN = callsEmitted;
           let nr = 0, attempts = 0, emptyStreak = 0;
@@ -341,7 +347,10 @@ export class DsWebAdapter {
             if (callsEmitted > beforeN) break;
             if (/^DONE\b/i.test(ntxt)) break;
             const planAgain = ntxt && plansMoreAction(ntxt);
-            if (ntxt && !planAgain) break;
+            const loose = !sawTruncated && !thinkOnly;
+            const tooShort = ntxt && loose && ntxt.length < 25 && !PLAN_NEG.test(ntxt);
+            if (ntxt && !planAgain && !tooShort) break;
+            if (tooShort) dw('NUDGE short-answer diabaikan\n');
             if (planAgain) dw('NUDGE plan-prose diabaikan\n');
             const nAct = Boolean(rawNtxt) || nbuf.some((e) => e.type === 'reasoning-delta' || e.type === 'tool-call-delta');
             if (!ntxt && !nAct && emptyStreak < 1) { emptyStreak++; dw('NUDGE empty-retry' + String.fromCharCode(10)); continue; }

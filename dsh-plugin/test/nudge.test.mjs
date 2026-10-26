@@ -165,4 +165,27 @@ async function run(gen) {
 }
 
 U.WebClient.prototype.createChatSession = asli;
+
+// 12) jawaban pendek tanpa rencana sama sekali -> tetap ditagih (shortOpenish)
+{
+  const r = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 10 + n };
+    if (n === 1) { yield { type: 'text', delta: 'Baik ya.' }; return; }
+    yield { type: 'text', delta: blk };
+  });
+  assert.ok(r.tool, 'jawaban pendek harus ditagih, dapat: ' + r.out);
+  assert.ok(r.reqs.length >= 2, 'harus ada ronde tagih kedua request');
+}
+
+// 13) blok tanpa nama tool (invoke hilang) -> buangan bersuara + tagih ulang
+{
+  const blkBad = '<' + Q + 'DSML' + Q + 'function_calls>\n<' + Q + 'DSML' + Q + 'parameter name="q" string="true">x</' + Q + 'DSML' + Q + 'parameter>\n</' + Q + 'DSML' + Q + 'function_calls>';
+  const r = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 30 + n };
+    if (n === 1) { yield { type: 'text', delta: 'Ambil datanya.' + blkBad }; return; }
+    yield { type: 'text', delta: blk };
+  });
+  assert.ok(r.tool, 'call tanpa nama harus ditagih ulang');
+}
+
 console.log('OK nudge');
