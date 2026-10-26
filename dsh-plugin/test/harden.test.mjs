@@ -9,6 +9,8 @@ assert.ok(plansMoreAction("I'll check the server logs."), 'EN rencana');
 assert.ok(!plansMoreAction('Sudah saya jalankan kok.'), 'lampau bukan rencana');
 assert.ok(!plansMoreAction('Selesai, semuanya sudah beres.'), 'selesai bukan rencana');
 assert.ok(!plansMoreAction('Fiturnya ada di file config.'), 'netral bukan rencana');
+assert.ok(plansMoreAction('Sekarang jelas: pesan assistant kosong itu normal, tapi turn setelah tool result tidak pernah menghasilkan teks. Saya instrumentasi adapter untuk melihat apa yang diterima.'), 'verba polos pasca-klausa panjang = rencana');
+assert.ok(!plansMoreAction('Saya tidak menemukan masalah di bagian ini.'), 'negasi bukan rencana');
 assert.ok(plansMoreAction('Interface sudah lengkap. Sekarang saya tulis provider host.'), 'klausa netral tak membunuh klausa rencana');
 assert.ok(plansMoreAction('Sudah selesai bagian A. Saya cek bagian B dulu.'), 'rencana pasca-selesai tetap rencana');
 import { shortOpenish } from '../src/adapter.js';

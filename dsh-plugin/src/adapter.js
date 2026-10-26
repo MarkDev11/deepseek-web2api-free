@@ -109,9 +109,10 @@ export function shortOpenish(text) {
   return t.length > 0 && t.length <= 220 && !PLAN_NEG.test(t);
 }
 
+const PLAN_BARE = /^\s*(?:dan |lalu |kemudian |sekarang |nanti |baik |oke |jadi |untuk itu )*(saya|aku)\s+(?!tidak\b|bukan\b|belum\b|tak\b|sudah\b|telah\b|selesai\b|suka\b|merasa\b|mungkin\b)([a-z][a-ză-žğ]{4,})/i;
 export function plansMoreAction(text) {
   const t = String(text || '');
-  return t.split(/[.;!?\n]+/).some((cl) => PLAN_PAT.test(cl) && !PLAN_NEG.test(cl));
+  return t.split(/[.;!?\n]+/).some((cl) => (PLAN_PAT.test(cl) || PLAN_BARE.test(cl)) && !PLAN_NEG.test(cl));
 }
 
 export function checkToolNonce(parsed, nonce) {
