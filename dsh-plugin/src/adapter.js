@@ -214,7 +214,7 @@ export class DsWebAdapter {
       try {
         sess = await this.sessionFor(acct, opts);
         const nonce = Math.random().toString(36).slice(2, 10);
-        const prompt = promptBase + ((opts.tools || []).length ? '\n\nTOOL BINDING: in every tool call include a parameter named "_nonce" with the exact value "' + nonce + '" (string="true"). A call with a different _nonce is stale and will be discarded.' : '');
+        const prompt = promptBase + ((opts.tools || []).length ? '\n\nSTOP PROTOCOL: If any action is still needed, emit the complete tool block. If everything for this request is truly finished, end your final reply with the exact token [done]. Never stop without one of the two.' + '\n\nTOOL BINDING: in every tool call include a parameter named "_nonce" with the exact value "' + nonce + '" (string="true"). A call with a different _nonce is stale and will be discarded.' : '');
         let sendPrompt = prompt;
         if (sess.sessionId && sess.core != null) {
           if (corePrompt === sess.core) {
@@ -323,7 +323,7 @@ export class DsWebAdapter {
         } else if (held && !continued) { yielded = true; yield { type: 'text-delta', text: held }; }
         const thinkOnly = !partialAll && hadThinking && !sawTools;
         const withTools = (opts.tools || []).length > 0;
-        if (!sawTools && !nudged && curParent && (sawTruncated || thinkOnly || (withTools && (plansMoreAction(partialAll) || shortOpenish(partialAll))))) {
+        if (!sawTools && !nudged && curParent && (sawTruncated || thinkOnly || (withTools && !/\[\s*done\s*\]/i.test(partialAll)))) {
           nudged = true;
           const beforeN = callsEmitted;
           let nr = 0, attempts = 0, emptyStreak = 0;
@@ -337,7 +337,7 @@ export class DsWebAdapter {
             nbuf = [];
             const nPrompt = (thinkOnly
               ? ('Your previous response contained reasoning only, with no answer. Continue now: ' + (withTools ? 'emit ONLY the complete ｜DSML｜function_calls block (with the "_nonce" parameter set to "' + nonce + '") or write your actual answer text.' : 'write your actual answer text now.') + ' Never reply with reasoning only. Never reply with just the _nonce value by itself, it is not an answer.')
-              : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete ｜DSML｜function_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE. Never reply with just the _nonce value by itself.'))
+              : ('Reminder: this reply MUST end with a tool block or the exact token [done]; you stopped without either. ' + 'You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete ｜DSML｜function_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE. Never reply with just the _nonce value by itself.'))
               + (forceNoThink ? ' Reply with final content only, no reasoning.' : '')
               + (nr >= 2 ? ' You replied with a plan already. Do NOT write another plan sentence: reply with ONLY the tool block now, or DONE.' : '');
             try { for await (const ev of consume(slot(guard(client.streamCompletion({ sessionId, prompt: nPrompt, thinkingEnabled: forceNoThink ? false : thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE)), false)) nbuf.push(ev); } catch (ne) { if (ne && ne.code === 'UPSTREAM_STALL') { dw('NUDGE stall-round\n'); nbuf = []; } else throw ne; }
@@ -347,6 +347,7 @@ export class DsWebAdapter {
             else if (ntxt) ntxt = ntxt.replace(new RegExp('(?:' + String.fromCharCode(92) + 'r?' + String.fromCharCode(92) + 'n)+' + String.fromCharCode(92) + 's*' + nonce + String.fromCharCode(92) + 's*$'), '').trim();
             if (callsEmitted > beforeN) break;
             if (/^DONE\b/i.test(ntxt)) break;
+            if (/\[\s*done\s*\]/i.test(ntxt)) { ntxt = ntxt.replace(/\s*\[\s*done\s*\]/gi, ' ').trim(); if (ntxt.length < 12) ntxt = ''; break; }
             const planAgain = ntxt && plansMoreAction(ntxt);
             const loose = !sawTruncated && !thinkOnly;
             const tooShort = ntxt && loose && ntxt.length < 25 && !PLAN_NEG.test(ntxt);
@@ -360,7 +361,7 @@ export class DsWebAdapter {
           nudgePass = false;
           dw('NUDGE_END calls=' + (callsEmitted - beforeN) + ' txt=' + ntxt.length + '\n');
           if (callsEmitted > beforeN) { for (const ev of nbuf) yield ev; }
-          else if (ntxt && !/^DONE\b/i.test(ntxt)) { yielded = true; yield { type: 'text-delta', text: ntxt }; }
+          else if (ntxt && !/^DONE\b/i.test(ntxt)) { const fin = ntxt.replace(/\s*\[\s*done\s*\]/gi, ' ').trim(); if (fin) { yielded = true; yield { type: 'text-delta', text: fin }; } }
         }
         if (!yielded) {
           if (sess.reused) {

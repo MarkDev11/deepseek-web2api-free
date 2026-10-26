@@ -40,7 +40,7 @@ async function run(gen) {
 {
   const r2 = await run(async function* (n) {
     yield { type: 'meta', responseMessageId: 11 };
-    yield { type: 'text', delta: 'Sudah selesai, dark mode live di link yang sama.' };
+    yield { type: 'text', delta: 'Sudah selesai, dark mode live di link yang sama. [done]' };
   });
   assert.equal(r2.reqs.length, 1, 'final answer jangan di-nud: ' + r2.reqs.length);
 }
@@ -186,6 +186,20 @@ U.WebClient.prototype.createChatSession = asli;
     yield { type: 'text', delta: blk };
   });
   assert.ok(r.tool, 'call tanpa nama harus ditagih ulang');
+}
+
+
+// 14) protokol [done]: tanpa [done] -> ditagih + reminder; dengan [done] -> diam
+{
+  const r = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 60 + n };
+    if (n === 1) { yield { type: 'text', delta: 'Sekarang jelas: turn setelah tool result tidak pernah menghasilkan teks. Saya instrumentasi adapter untuk melihat apa yang diterima.' }; return; }
+    yield { type: 'text', delta: 'Sudah kuberes kan. [done]' };
+  });
+  assert.ok(r.reqs[0].includes('[done]'), 'prompt harus memuat STOP PROTOCOL [done]');
+  assert.equal(r.reqs.length, 2, 'tanpa [done] harus ditagih sekali');
+  assert.ok(/Reminder/.test(r.reqs[1]), 'tagihan menyertakan reminder');
+  assert.ok(!/\[done\]/.test(r.out), 'token [done] tidak membocori jawaban: ' + r.out);
 }
 
 console.log('OK nudge');
