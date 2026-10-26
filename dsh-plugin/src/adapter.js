@@ -187,6 +187,9 @@ export class DsWebAdapter {
         let curParent = sess.parentId || null;
         let nEvents = 0;
         const gate = { mode: 'watch', buf: '' };
+        let partialAll = '';
+        let continuationDone = false;
+        let continued = false;
         function* emitCall(tc) {
           const k = callKey(tc);
           if (seenCalls.has(k)) return;
@@ -219,6 +222,7 @@ export class DsWebAdapter {
             else if (ev.type === 'text' && ev.delta) {
               if (DBG) DBG.write('X' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
               const r = sieve.feed(ev.delta);
+              partialAll += (r.text || '');
               const st = searchStrip.feed(r.text || '');
               if (gated) yield* emitText(st);
               else if (st) yield { type: 'text-delta', text: st };
@@ -234,15 +238,34 @@ export class DsWebAdapter {
           if (tailT.text) { yielded = true; yield { type: 'reasoning-delta', text: tailT.text }; }
           for (const tc of tailT.toolCalls) yield* emitCall(tc);
         }
-        yield* consume(client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), true);
+        let midErr = null;
+        try {
+          yield* consume(client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), true);
+        } catch (eMid) {
+          const contable = eMid && (eMid.code === 'UPSTREAM_HINT' || eMid.code === 'RATE_LIMIT' || eMid.code === 'UPSTREAM_TIMEOUT') && yielded && !sawTools && !continuationDone && curParent;
+          if (!contable) throw eMid;
+          midErr = eMid;
+        }
+        if (midErr) {
+          continuationDone = true;
+          await new Promise((rr) => setTimeout(rr, midErr.code === 'RATE_LIMIT' ? 4000 : 1500));
+          const sofar = partialAll.slice(-500);
+          const contPrompt = 'Your previous response was cut short by a server error after this text: \"\"\"' + sofar + '\"\"\". Continue from exactly that point, in the same language, without repeating any of it and without starting over.';
+          const evB4C = nEvents;
+          try {
+            yield* consume(client.streamCompletion({ sessionId, prompt: contPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false);
+          } catch (eCont) { throw midErr; }
+          if (nEvents !== evB4C) continued = true;
+          else { throw midErr; }
+        }
         let held = gate.buf; gate.buf = '';
-        if (held && !sawTools && curParent && looksLikeToolIntent(held)) {
+        if (held && !continued && !sawTools && curParent && looksLikeToolIntent(held)) {
           const evBefore = nEvents;
           gate.mode = 'open';
           const repairNote = 'Your previous response tried to call a tool but the envelope was invalid. Reply again with ONLY the \uff5cDSML\uff5cfunction_calls block for the next action, including the "_nonce" parameter set to "' + nonce + '". No prose, no JSON.';
           yield* consume(client.streamCompletion({ sessionId, prompt: repairNote, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false);
           if (nEvents === evBefore) { yielded = true; yield { type: 'text-delta', text: held }; }
-        } else if (held) { yielded = true; yield { type: 'text-delta', text: held }; }
+        } else if (held && !continued) { yielded = true; yield { type: 'text-delta', text: held }; }
         if (!yielded) {
           if (sess.reused) {
             // sesi lama diabaikan upstream -> buka satu sesi baru (tetap satu sesi per percakapan)
