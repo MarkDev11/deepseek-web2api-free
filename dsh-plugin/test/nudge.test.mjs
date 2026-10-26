@@ -1,0 +1,60 @@
+import assert from 'node:assert/strict';
+import { DsWebAdapter } from '../src/adapter.js';
+import * as U from '../src/upstream/index.js';
+const Q = '\uff5c';
+const TOOLS = [{ type: 'function', function: { name: 'cek', description: 'cek', parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] } } }];
+function mk() {
+  const a = new DsWebAdapter({ storePath: process.env.TEMP + '/dsweb-test-nudge.json' });
+  a.ensureAccount = async () => ({ id: 'acct_sim', token: 'x'.repeat(24), cookies: '' });
+  return a;
+}
+const asli = U.WebClient.prototype.createChatSession;
+const blk = '<' + Q + 'DSML' + Q + 'invoke name="cek"><' + Q + 'DSML' + Q + 'parameter name="q" string="true">halo</' + Q + 'DSML' + Q + 'parameter></' + Q + 'DSML' + Q + 'invoke>';
+async function run(gen) {
+  const reqs = [];
+  U.WebClient.prototype.createChatSession = async function () { return 's1'; };
+  U.WebClient.prototype.streamCompletion = async function* (o) { reqs.push(o.prompt); yield* gen(reqs.length, o); };
+  let out = '', tool = null;
+  for await (const ev of mk().stream({ messages: [{ role: 'user', content: 'kerja' }], model: 'deepseek-chat', thinking: false, search: false, tools: TOOLS })) {
+    if (ev.type === 'text-delta') out += ev.text;
+    if (ev.type === 'tool-call-delta') tool = (tool || '') + (ev.argumentsTextDelta || '');
+  }
+  return { reqs, out, tool };
+}
+
+// 1) janji tanpa call -> nud sekali, call dari nud diterima
+{
+  const r1 = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 10 };
+    if (n === 1) { yield { type: 'text', delta: 'Saya cek dulu ya.' }; return; }
+    yield { type: 'text', delta: blk };
+  });
+  assert.equal(r1.reqs.length, 2, 'harus ada nud');
+  assert.ok(r1.reqs[1].includes('function_calls'), r1.reqs[1]);
+  assert.ok(r1.out.includes('Saya cek dulu'), r1.out);
+  assert.equal(r1.tool, JSON.stringify({ q: 'halo' }));
+}
+
+// 2) jawaban final wajar -> TIDAK ada nud
+{
+  const r2 = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 11 };
+    yield { type: 'text', delta: 'Sudah selesai, dark mode live di link yang sama.' };
+  });
+  assert.equal(r2.reqs.length, 1, 'final answer jangan di-nud: ' + r2.reqs.length);
+}
+
+// 3) DSML terpotong di akhir -> sampah ditahan, nud menghasilkan call bersih
+{
+  const r3 = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 12 };
+    if (n === 1) { yield { type: 'text', delta: 'Mengubah<' + Q + 'DSML' + Q + 'invoke name="cek"><' + Q + 'DSML' + Q + 'parameter name="q" string="true">par' }; return; }
+    yield { type: 'text', delta: blk };
+  });
+  assert.equal(r3.reqs.length, 2, 'truncation harus memicu nud');
+  assert.ok(!r3.out.includes('par'), 'sampah terpotong tidak boleh tampil: ' + r3.out);
+  assert.equal(r3.tool, JSON.stringify({ q: 'halo' }));
+}
+
+U.WebClient.prototype.createChatSession = asli;
+console.log('OK nudge');

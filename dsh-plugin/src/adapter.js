@@ -190,6 +190,9 @@ export class DsWebAdapter {
         let partialAll = '';
         let continuationDone = false;
         let continued = false;
+        let callsEmitted = 0;
+        let sawTruncated = false;
+        let nudged = false;
         function* emitCall(tc) {
           const k = callKey(tc);
           if (seenCalls.has(k)) return;
@@ -197,7 +200,7 @@ export class DsWebAdapter {
           if (!parsed) { try { parsed = JSON.parse(tc.arguments || '{}'); } catch { parsed = null; } }
           const chk = checkToolNonce(parsed, nonce);
           if (!chk.ok) return;
-          seenCalls.add(k); sawTools = true;
+          seenCalls.add(k); sawTools = true; callsEmitted++;
           const coerced = coerceToolArgs(chk.parsed, toolSchemas.get(tc.name));
           yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: JSON.stringify(coerced ?? {}) };
         }
@@ -229,8 +232,11 @@ export class DsWebAdapter {
               for (const tc of r.toolCalls) yield* emitCall(tc);
             }
           }
+          const openBeforeFlush = sieve.inDsml;
           const tail = sieve.flush();
           const sTail = searchStrip.feed((tail && tail.text) || '') + searchStrip.flush();
+          if (gated && openBeforeFlush && tail.toolCalls.length === 0) { if (sTail) sawTruncated = true; }
+          else
           if (gated) yield* emitText(sTail);
           else if (sTail) yield { type: 'text-delta', text: sTail };
           for (const tc of tail.toolCalls) yield* emitCall(tc);
@@ -266,6 +272,15 @@ export class DsWebAdapter {
           yield* consume(client.streamCompletion({ sessionId, prompt: repairNote, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false);
           if (nEvents === evBefore) { yielded = true; yield { type: 'text-delta', text: held }; }
         } else if (held && !continued) { yielded = true; yield { type: 'text-delta', text: held }; }
+        if ((opts.tools || []).length && !sawTools && !nudged && curParent && (sawTruncated || new RegExp('\\b(I\'?ll|I will|Let me|Now I|Now, let|First,? I|Next,? I|Then I|I need to|I must|Sekarang saya|akan saya|biar saya|perlu saya|Saya\\s+(?:akan\\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau)|aku\\s+(?:akan\\s+)?(?:tambahkan|cek|coba|mau))\\b', 'i').test(partialAll))) {
+          nudged = true;
+          const beforeN = callsEmitted;
+          const nbuf = [];
+          for await (const ev of consume(client.streamCompletion({ sessionId, prompt: 'You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '"). If everything is already done, reply DONE.', thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false)) nbuf.push(ev);
+          const ntxt = nbuf.filter((e) => e.type === 'text-delta').map((e) => e.text).join('').trim();
+          if (callsEmitted > beforeN) { for (const ev of nbuf) yield ev; }
+          else if (ntxt && !/^DONE\b/i.test(ntxt)) { yielded = true; yield { type: 'text-delta', text: ntxt }; }
+        }
         if (!yielded) {
           if (sess.reused) {
             // sesi lama diabaikan upstream -> buka satu sesi baru (tetap satu sesi per percakapan)
