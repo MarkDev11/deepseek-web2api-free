@@ -5,6 +5,29 @@ import { createHash } from 'node:crypto';
 import { buildToolSystemPrompt, DsmlStreamSieve } from './dsml.js';
 const DBG_PATH = process.env.DSWEB_DEBUG !== undefined ? process.env.DSWEB_DEBUG : 'E:\\TESTING\\deepseekapi\\dsweb-debug.log';
 const DBG = DBG_PATH && DBG_PATH !== '0' ? fs.createWriteStream(DBG_PATH, { flags: 'a' }) : null;
+const STALL_FIRST = Number(process.env.DSWEB_STALL_FIRST_MS || 40000);
+const STALL_IDLE = Number(process.env.DSWEB_STALL_IDLE_MS || 10000);
+function guard(iter, firstMs, idleMs) {
+  let gotFirst = false;
+  return (async function* () {
+    try {
+      while (true) {
+        const p = iter.next();
+        let to = null;
+        const res = await Promise.race([
+          p.then((r) => ({ r }), (e) => ({ e })),
+          new Promise((done) => { to = setTimeout(() => done({ stall: true }), gotFirst ? idleMs : firstMs); })
+        ]);
+        clearTimeout(to);
+        if (res.stall) { try { if (iter.return) void Promise.resolve(iter.return()).catch(() => {}); } catch {} const er = new Error('upstream stream stalled'); er.code = 'UPSTREAM_STALL'; throw er; }
+        if (res.e) throw res.e;
+        if (res.r.done) return;
+        gotFirst = true;
+        yield res.r.value;
+      }
+    } finally { try { if (iter.return) void Promise.resolve(iter.return()).catch(() => {}); } catch {} }
+  })();
+}
 
 export function coerceToolArgs(parsed, schema) {
   if (!parsed || !schema || !schema.properties) return parsed;
@@ -256,7 +279,7 @@ export class DsWebAdapter {
         let midErr = null;
         try {
           if (DBG) DBG.write('REQ1 n=' + sendPrompt.length + ' parent=' + (curParent || 'null') + ' tools=' + ((opts.tools || []).length) + '\n');
-          yield* consume(client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), true);
+          try { yield* consume(guard(client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE), true); } catch (se) { if (se && se.code === 'UPSTREAM_STALL') { if (DBG) DBG.write('STALL mid-stream' + String.fromCharCode(10)); sawTruncated = true; } else throw se; }
         } catch (eMid) {
           const contable = eMid && (eMid.code === 'UPSTREAM_HINT' || eMid.code === 'RATE_LIMIT' || eMid.code === 'UPSTREAM_TIMEOUT') && yielded && !sawTools && !continuationDone && curParent;
           if (!contable) throw eMid;
@@ -269,7 +292,7 @@ export class DsWebAdapter {
           const contPrompt = 'Your previous response was cut short by a server error after this text: \"\"\"' + sofar + '\"\"\". Continue from exactly that point, in the same language, without repeating any of it and without starting over.';
           const evB4C = nEvents;
           try {
-            yield* consume(client.streamCompletion({ sessionId, prompt: contPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false);
+            yield* consume(guard(client.streamCompletion({ sessionId, prompt: contPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE), false);
           } catch (eCont) { throw midErr; }
           if (nEvents !== evB4C) continued = true;
           else { throw midErr; }
@@ -279,7 +302,7 @@ export class DsWebAdapter {
           const evBefore = nEvents;
           gate.mode = 'open';
           const repairNote = 'Your previous response tried to call a tool but the envelope was invalid. Reply again with ONLY the \uff5cDSML\uff5cfunction_calls block for the next action, including the "_nonce" parameter set to "' + nonce + '". No prose, no JSON.';
-          yield* consume(client.streamCompletion({ sessionId, prompt: repairNote, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false);
+          yield* consume(guard(client.streamCompletion({ sessionId, prompt: repairNote, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE), false);
           if (nEvents === evBefore) { yielded = true; yield { type: 'text-delta', text: held }; }
         } else if (held && !continued) { yielded = true; yield { type: 'text-delta', text: held }; }
         const thinkOnly = !partialAll && hadThinking && !sawTools;
@@ -301,7 +324,7 @@ export class DsWebAdapter {
               : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete ｜DSML｜function_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE. Never reply with just the _nonce value by itself.'))
               + (forceNoThink ? ' Reply with final content only, no reasoning.' : '')
               + (nr >= 2 ? ' You replied with a plan already. Do NOT write another plan sentence: reply with ONLY the tool block now, or DONE.' : '');
-            for await (const ev of consume(client.streamCompletion({ sessionId, prompt: nPrompt, thinkingEnabled: forceNoThink ? false : thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false)) nbuf.push(ev);
+            for await (const ev of consume(guard(client.streamCompletion({ sessionId, prompt: nPrompt, thinkingEnabled: forceNoThink ? false : thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), STALL_FIRST, STALL_IDLE), false)) nbuf.push(ev);
             const rawNtxt = nbuf.filter((e) => e.type === 'text-delta').map((e) => e.text).join('').trim();
             ntxt = rawNtxt;
             if (ntxt && ntxt === String(nonce)) { if (DBG) DBG.write('DROP bare-nonce' + String.fromCharCode(10)); ntxt = ''; }
@@ -356,7 +379,7 @@ export class DsWebAdapter {
         // akun mati/mute dan belum ada output -> coba akun lain (atau popup login) sekali
         if (!yielded && (isMuted || isAuth) && attempt === 0) { lastErr = e; continue; }
         if (sess && sess.sessionId && e.code === 'UPSTREAM_PARENT') { this.sessions.delete(this.keyFor(acct, opts)); this.lastUsedAt.set(this.keyFor(acct, opts), Date.now() + this.keepAliveTtlMs); void client.deleteSession(sess.sessionId); sess.parentId = null; sess.sessionId = null; } // parent ditolak = sesi beracun: buang sebelum retry
-        if (!yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT' || e.code === 'UPSTREAM_TIMEOUT' || e.code === 'UPSTREAM_PARENT') && attempt < 2) { const waitMs = e.code === 'UPSTREAM_PARENT' ? 0 : (e.code === 'RATE_LIMIT' ? 6000 : (attempt === 0 ? 5000 : 15000)); await new Promise((rr) => setTimeout(rr, waitMs)); lastErr = e; continue; }
+        if (!yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT' || e.code === 'UPSTREAM_TIMEOUT' || e.code === 'UPSTREAM_PARENT' || e.code === 'UPSTREAM_STALL') && attempt < 2) { const waitMs = e.code === 'UPSTREAM_PARENT' ? 0 : (e.code === 'RATE_LIMIT' ? 6000 : (attempt === 0 ? 5000 : 15000)); await new Promise((rr) => setTimeout(rr, waitMs)); lastErr = e; continue; }
         if (sess && sess.sessionId && !yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT')) { this.sessions.delete(this.keyFor(acct, opts)); this.lastUsedAt.set(this.keyFor(acct, opts), Date.now() + this.keepAliveTtlMs); void client.deleteSession(sess.sessionId); }
         throw e;
       }
