@@ -116,7 +116,7 @@ export class DsWebAdapter {
     yield { type: 'block-start' };
     let lastErr;
     let sess = null;
-    for (let attempt = 0; attempt < 2; attempt++ ) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       const acct = await this.ensureAccount();
       const client = new WebClient(acct, { onCookies: (c) => this.store.updateCookies(acct.id, c) });
       const sieve = new DsmlStreamSieve();
@@ -196,7 +196,8 @@ export class DsWebAdapter {
         if (isMuted) this.store.markMuted(acct.id, e && e.muteUntil);
         if (isAuth) this.store.removeAccount(acct.id); // token mati tak bisa pulih sendiri: hapus saja
         // akun mati/mute dan belum ada output -> coba akun lain (atau popup login) sekali
-        if ((isMuted || isAuth || e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT') && !yielded && attempt === 0) { if (e.code === 'RATE_LIMIT') { await new Promise((rr) => setTimeout(rr, 6000)); } lastErr = e; continue; }
+        if (!yielded && (isMuted || isAuth) && attempt === 0) { lastErr = e; continue; }
+        if (!yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT') && attempt < 2) { const waitMs = e.code === 'RATE_LIMIT' ? 6000 : (attempt === 0 ? 5000 : 15000); await new Promise((rr) => setTimeout(rr, waitMs)); lastErr = e; continue; }
         if (sess && sess.sessionId && !yielded && (e.code === 'RATE_LIMIT' || e.code === 'UPSTREAM_HINT')) { this.sessions.delete(this.keyFor(acct, opts)); this.lastUsedAt.set(this.keyFor(acct, opts), Date.now() + this.keepAliveTtlMs); }
         throw e;
       }
