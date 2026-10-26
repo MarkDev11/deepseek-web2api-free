@@ -7,7 +7,7 @@ const DBG_PATH = process.env.DSWEB_DEBUG !== undefined ? process.env.DSWEB_DEBUG
 const DBG = DBG_PATH && DBG_PATH !== '0' ? fs.createWriteStream(DBG_PATH, { flags: 'a' }) : null;
 const dw = (s) => { if (DBG) DBG.write(new Date().toISOString().slice(11, 23) + ' ' + s); };
 const STALL_FIRST = Number(process.env.DSWEB_STALL_FIRST_MS || 40000);
-const STALL_IDLE = Number(process.env.DSWEB_STALL_IDLE_MS || 10000);
+const STALL_IDLE = Number(process.env.DSWEB_STALL_IDLE_MS || 35000);
 function makeSem(max) { let n = 0; const q = []; return {
   a() { if (n < max) { n++; return Promise.resolve(); } return new Promise((r) => q.push(r)); },
   r() { const w = q.shift(); if (w) w(); else n--; }
@@ -102,10 +102,11 @@ export function looksLikeToolIntent(text) {
     return arr.some((x) => x && typeof x === 'object' && (('arguments' in x) && (x.name || (x.function && x.function.name))) || (x && x.function && 'arguments' in x.function));
   } catch { return false; }
 }
+const PLAN_NEG = /(sudah|telah|selesai|\bdone\b|\balready\b|\bcompleted\b)/i;
+const PLAN_PAT = /\b(I'?ll|I will|let me|now I|going to|gonna|i am going|i'?d better|first,? I|next,? I|then I|I need to|I must|sekarang saya|sedang saya|akan saya|saya akan|akan ku[a-z]+|biar saya|perlu saya|saya\s+(?:akan\s+|sedang\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau|terapkan|perbaiki|lanjutkan|baca|telusuri|lacak|uji|ganti|siapkan)|aku\s+(?:akan\s+)?(?:tambahkan|cek|coba|mau))\b/i;
 export function plansMoreAction(text) {
   const t = String(text || '');
-  if (/(sudah|telah|selesai|\bdone\b|\balready\b|\bcompleted\b)/i.test(t)) return false;
-  return /\b(I'?ll|I will|let me|now I|going to|gonna|i am going|i'?d better|first,? I|next,? I|then I|I need to|I must|sekarang saya|sedang saya|akan saya|saya akan|akan ku[a-z]+|biar saya|perlu saya|saya\s+(?:akan\s+|sedang\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau|terapkan|perbaiki|lanjutkan|baca|telusuri|lacak|uji|ganti|siapkan)|aku\s+(?:akan\s+)?(?:tambahkan|cek|coba|mau))\b/i.test(t);
+  return t.split(/[.;!?\n]+/).some((cl) => PLAN_PAT.test(cl) && !PLAN_NEG.test(cl));
 }
 
 export function checkToolNonce(parsed, nonce) {
