@@ -330,7 +330,7 @@ export class DsWebAdapter {
           let forceNoThink = false;
           let nbuf = [];
           let ntxt = '';
-          while (attempts < 5) {
+          while (attempts < 20) {
             attempts++;
             dw('NUDGE r' + attempts + ' thinkOnly=' + thinkOnly + ' trunc=' + sawTruncated + '\n');
             nudgePass = true;

@@ -76,7 +76,7 @@ async function run(gen) {
     yield { type: 'meta', responseMessageId: 14 };
     yield { type: 'thinking', delta: 'Hmm...' };
   });
-  assert.equal(r5.reqs.length, 6, 'main + 5 nud (cap attempts)');
+  assert.equal(r5.reqs.length, 21, 'main + 20 nud (cap attempts)');
   assert.equal(r5.out, '');
 }
 
