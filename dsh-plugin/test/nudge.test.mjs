@@ -56,5 +56,28 @@ async function run(gen) {
   assert.equal(r3.tool, JSON.stringify({ q: 'halo' }));
 }
 
+// 4) thinking-only -> nud 'reasoning only', jawaban asli menyusul
+{
+  const r4 = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 13 };
+    yield { type: 'thinking', delta: 'Hmm saya perlu menjawab...' };
+    if (n === 1) return;
+    yield { type: 'text', delta: 'Jawaban asli untukmu.' };
+  });
+  assert.equal(r4.reqs.length, 2, 'thinking-only harus di-nud');
+  assert.ok(r4.reqs[1].includes('reasoning only'), r4.reqs[1]);
+  assert.ok(r4.out.includes('Jawaban asli'), r4.out);
+}
+
+// 5) thinking-only dua kali -> tidak throw, tetap selesai
+{
+  const r5 = await run(async function* () {
+    yield { type: 'meta', responseMessageId: 14 };
+    yield { type: 'thinking', delta: 'Hmm...' };
+  });
+  assert.equal(r5.reqs.length, 2);
+  assert.equal(r5.out, '');
+}
+
 U.WebClient.prototype.createChatSession = asli;
 console.log('OK nudge');

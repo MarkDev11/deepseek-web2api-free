@@ -193,6 +193,7 @@ export class DsWebAdapter {
         let callsEmitted = 0;
         let sawTruncated = false;
         let nudged = false;
+        let hadThinking = false;
         function* emitCall(tc) {
           const k = callKey(tc);
           if (seenCalls.has(k)) return;
@@ -217,7 +218,7 @@ export class DsWebAdapter {
         async function* consume(iter, gated) {
           for await (const ev of iter) {
             if (ev.type === 'meta' && ev.responseMessageId) { curParent = ev.responseMessageId; sess.parentId = curParent; sess.at = Date.now(); nEvents++; continue; }
-            if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
+            if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true; hadThinking = true;
               const tr = thinkSieve.feed(ev.delta);
               if (tr.text) yield { type: 'reasoning-delta', text: tr.text };
               for (const tc of tr.toolCalls) yield* emitCall(tc);
@@ -272,11 +273,13 @@ export class DsWebAdapter {
           yield* consume(client.streamCompletion({ sessionId, prompt: repairNote, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false);
           if (nEvents === evBefore) { yielded = true; yield { type: 'text-delta', text: held }; }
         } else if (held && !continued) { yielded = true; yield { type: 'text-delta', text: held }; }
-        if ((opts.tools || []).length && !sawTools && !nudged && curParent && (sawTruncated || new RegExp('\\b(I\'?ll|I will|Let me|Now I|Now, let|First,? I|Next,? I|Then I|I need to|I must|Sekarang saya|akan saya|biar saya|perlu saya|Saya\\s+(?:akan\\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau)|aku\\s+(?:akan\\s+)?(?:tambahkan|cek|coba|mau))\\b', 'i').test(partialAll))) {
+        const thinkOnly = !partialAll && hadThinking && !sawTools;
+        const withTools = (opts.tools || []).length > 0;
+        if (!sawTools && !nudged && curParent && (sawTruncated || thinkOnly || (withTools && new RegExp('\\b(I\'?ll|I will|Let me|Now I|Now, let|First,? I|Next,? I|Then I|I need to|I must|Sekarang saya|akan saya|biar saya|perlu saya|Saya\\s+(?:akan\\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau)|aku\\s+(?:akan\\s+)?(?:tambahkan|cek|coba|mau))\\b', 'i').test(partialAll)))) {
           nudged = true;
           const beforeN = callsEmitted;
           const nbuf = [];
-          for await (const ev of consume(client.streamCompletion({ sessionId, prompt: 'You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '"). If everything is already done, reply DONE.', thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false)) nbuf.push(ev);
+          for await (const ev of consume(client.streamCompletion({ sessionId, prompt: thinkOnly ? ('Your previous response contained reasoning only, with no answer. Continue now: ' + (withTools ? 'emit ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '") or write your actual answer text.' : 'write your actual answer text now.') + ' Never reply with reasoning only.') : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE.'), thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false)) nbuf.push(ev);
           const ntxt = nbuf.filter((e) => e.type === 'text-delta').map((e) => e.text).join('').trim();
           if (callsEmitted > beforeN) { for (const ev of nbuf) yield ev; }
           else if (ntxt && !/^DONE\b/i.test(ntxt)) { yielded = true; yield { type: 'text-delta', text: ntxt }; }
