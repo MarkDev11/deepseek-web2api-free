@@ -61,6 +61,27 @@ export function formatMessagesToPrompt(messages, tools) {
   return parts.join('\n\n');
 }
 
+export function looksLikeToolIntent(text) {
+  let t = String(text || '').trim();
+  if (/^```(?:json)?/i.test(t)) t = t.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  if (/<tool[\s>/]/i.test(t) || /tool_use/i.test(t)) return true;
+  if (!/^[\[{]/.test(t)) return false;
+  if (/^\{\s*"(?:name|function)"\s*:/i.test(t)) return true;
+  try {
+    const j = JSON.parse(t);
+    const arr = Array.isArray(j) ? j : [j];
+    return arr.some((x) => x && typeof x === 'object' && (('arguments' in x) && (x.name || (x.function && x.function.name))) || (x && x.function && 'arguments' in x.function));
+  } catch { return false; }
+}
+export function checkToolNonce(parsed, nonce) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: true, parsed: parsed || {} };
+  const v = parsed._nonce;
+  if (v === undefined) return { ok: true, parsed };
+  if (String(v) !== String(nonce)) return { ok: false, parsed };
+  const rest = Object.assign({}, parsed); delete rest._nonce;
+  return { ok: true, parsed: rest };
+}
+
 function normSearch(s) { return s.replace(/FINISHED/g, '').replace(/\[citation:(\d+)\]/g, '[$1]'); }
 export class SearchStripper {
   constructor(enabled) { this.on = Boolean(enabled); this.head = ''; this.done = !this.on; }
@@ -127,15 +148,10 @@ export class DsWebAdapter {
   async *stream(options) {
     const opts = options || {};
     const corePrompt = formatMessagesToPrompt(opts.messages || [], opts.tools || []);
-    let prompt = corePrompt;
-    if ((opts.tools || []).length) prompt += '\n\nREMINDER: To take an action, reply with ONLY the \uff5cDSML\uff5cfunction_calls block as your entire reply - never code, never prose. The tags are XML-like with a single |DSML| prefix on each tag.';
+    let promptBase = corePrompt;
+    if ((opts.tools || []).length) promptBase += '\n\nREMINDER: To take an action, reply with ONLY the \uff5cDSML\uff5cfunction_calls block as your entire reply - never code, never prose. The tags are XML-like with a single |DSML| prefix on each tag.';
     const toolSchemas = new Map((opts.tools || []).map((tt) => { const f = tt.function || tt; return [f.name, f.parameters]; }));
-    const emitArgs = (tc) => {
-      let parsed = tc.parsedArguments;
-      if (!parsed) { try { parsed = JSON.parse(tc.arguments || '{}'); } catch { parsed = null; } }
-      const coerced = coerceToolArgs(parsed, toolSchemas.get(tc.name));
-      return JSON.stringify(coerced ?? {});
-    };
+
     yield { type: 'block-start' };
     let lastErr;
     let sess = null;
@@ -153,6 +169,8 @@ export class DsWebAdapter {
       let yielded = false;
       try {
         sess = await this.sessionFor(acct, opts);
+        const nonce = Math.random().toString(36).slice(2, 10);
+        const prompt = promptBase + ((opts.tools || []).length ? '\n\nTOOL BINDING: in every tool call include a parameter named "_nonce" with the exact value "' + nonce + '" (string="true"). A call with a different _nonce is stale and will be discarded.' : '');
         let sendPrompt = prompt;
         if (sess.sessionId && sess.core != null) {
           if (corePrompt === sess.core) {
@@ -168,28 +186,63 @@ export class DsWebAdapter {
         if (!sess.sessionId) { sess.sessionId = sessionId; if (this.sessions.size >= 100) { let oldestKey = null; let oldest = Infinity; for (const [kOld, vOld] of this.sessions) { const atOld = vOld && typeof vOld.at === 'number' ? vOld.at : 0; if (atOld < oldest) { oldest = atOld; oldestKey = kOld; } } if (oldestKey) this.sessions.delete(oldestKey); } this.sessions.set(this.keyFor(acct, opts), sess); }
         let curParent = sess.parentId || null;
         let nEvents = 0;
-        for await (const ev of client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent })) {
-          if (ev.type === 'meta' && ev.responseMessageId) { curParent = ev.responseMessageId; sess.parentId = curParent; sess.at = Date.now(); nEvents++; continue; }
-          if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
-            const tr = thinkSieve.feed(ev.delta);
-            if (tr.text) yield { type: 'reasoning-delta', text: tr.text };
-            for (const tc of tr.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
-          }
-          else if (ev.type === 'text' && ev.delta) {
-            if (DBG) DBG.write('X' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
-            const r = sieve.feed(ev.delta);
-            const sTxt = searchStrip.feed(r.text || '');
-            if (sTxt) yield { type: 'text-delta', text: sTxt };
-            for (const tc of r.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
+        const gate = { mode: 'watch', buf: '' };
+        function* emitCall(tc) {
+          const k = callKey(tc);
+          if (seenCalls.has(k)) return;
+          let parsed = tc.parsedArguments;
+          if (!parsed) { try { parsed = JSON.parse(tc.arguments || '{}'); } catch { parsed = null; } }
+          const chk = checkToolNonce(parsed, nonce);
+          if (!chk.ok) return;
+          seenCalls.add(k); sawTools = true;
+          const coerced = coerceToolArgs(chk.parsed, toolSchemas.get(tc.name));
+          yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: JSON.stringify(coerced ?? {}) };
+        }
+        function* emitText(sTxt) {
+          if (!sTxt) return;
+          if (gate.mode === 'open') { yield { type: 'text-delta', text: sTxt }; return; }
+          gate.buf += sTxt;
+          if (gate.mode === 'hold') return;
+          if (gate.buf.length >= 20) {
+            if (looksLikeToolIntent(gate.buf)) gate.mode = 'hold';
+            else { gate.mode = 'open'; yield { type: 'text-delta', text: gate.buf }; gate.buf = ''; }
           }
         }
-        const tail = sieve.flush();
-        const sTail = searchStrip.feed((tail && tail.text) || '') + searchStrip.flush();
-        if (sTail) { yielded = true; yield { type: 'text-delta', text: sTail }; }
-        for (const tc of tail.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
-        const tailT = thinkSieve.flush();
-        if (tailT.text) { yielded = true; yield { type: 'reasoning-delta', text: tailT.text }; }
-        for (const tc of tailT.toolCalls) { const k = callKey(tc); if (!seenCalls.has(k)) { seenCalls.add(k); sawTools = true; yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: emitArgs(tc) }; } }
+        async function* consume(iter, gated) {
+          for await (const ev of iter) {
+            if (ev.type === 'meta' && ev.responseMessageId) { curParent = ev.responseMessageId; sess.parentId = curParent; sess.at = Date.now(); nEvents++; continue; }
+            if (ev.type === 'thinking' && ev.delta) { if (DBG) DBG.write('T' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
+              const tr = thinkSieve.feed(ev.delta);
+              if (tr.text) yield { type: 'reasoning-delta', text: tr.text };
+              for (const tc of tr.toolCalls) yield* emitCall(tc);
+            }
+            else if (ev.type === 'text' && ev.delta) {
+              if (DBG) DBG.write('X' + JSON.stringify(ev.delta) + '\n'); outChars += ev.delta.length; yielded = true;
+              const r = sieve.feed(ev.delta);
+              const st = searchStrip.feed(r.text || '');
+              if (gated) yield* emitText(st);
+              else if (st) yield { type: 'text-delta', text: st };
+              for (const tc of r.toolCalls) yield* emitCall(tc);
+            }
+          }
+          const tail = sieve.flush();
+          const sTail = searchStrip.feed((tail && tail.text) || '') + searchStrip.flush();
+          if (gated) yield* emitText(sTail);
+          else if (sTail) yield { type: 'text-delta', text: sTail };
+          for (const tc of tail.toolCalls) yield* emitCall(tc);
+          const tailT = thinkSieve.flush();
+          if (tailT.text) { yielded = true; yield { type: 'reasoning-delta', text: tailT.text }; }
+          for (const tc of tailT.toolCalls) yield* emitCall(tc);
+        }
+        yield* consume(client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), true);
+        let held = gate.buf; gate.buf = '';
+        if (held && !sawTools && curParent && looksLikeToolIntent(held)) {
+          const evBefore = nEvents;
+          gate.mode = 'open';
+          const repairNote = 'Your previous response tried to call a tool but the envelope was invalid. Reply again with ONLY the \uff5cDSML\uff5cfunction_calls block for the next action, including the "_nonce" parameter set to "' + nonce + '". No prose, no JSON.';
+          yield* consume(client.streamCompletion({ sessionId, prompt: repairNote, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false);
+          if (nEvents === evBefore) { yielded = true; yield { type: 'text-delta', text: held }; }
+        } else if (held) { yielded = true; yield { type: 'text-delta', text: held }; }
         if (!yielded) {
           if (sess.reused) {
             // sesi lama diabaikan upstream -> buka satu sesi baru (tetap satu sesi per percakapan)
