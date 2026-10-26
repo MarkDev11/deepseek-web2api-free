@@ -3,7 +3,8 @@ import { WebClient } from './upstream/index.js';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { buildToolSystemPrompt, DsmlStreamSieve } from './dsml.js';
-const DBG = process.env.DSWEB_DEBUG ? fs.createWriteStream(process.env.DSWEB_DEBUG, { flags: 'a' }) : null;
+const DBG_PATH = process.env.DSWEB_DEBUG !== undefined ? process.env.DSWEB_DEBUG : 'E:\\TESTING\\deepseekapi\\dsweb-debug.log';
+const DBG = DBG_PATH && DBG_PATH !== '0' ? fs.createWriteStream(DBG_PATH, { flags: 'a' }) : null;
 
 export function coerceToolArgs(parsed, schema) {
   if (!parsed || !schema || !schema.properties) return parsed;
@@ -247,6 +248,7 @@ export class DsWebAdapter {
         }
         let midErr = null;
         try {
+          if (DBG) DBG.write('REQ1 n=' + sendPrompt.length + ' parent=' + (curParent || 'null') + ' tools=' + ((opts.tools || []).length) + '\n');
           yield* consume(client.streamCompletion({ sessionId, prompt: sendPrompt, thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), true);
         } catch (eMid) {
           const contable = eMid && (eMid.code === 'UPSTREAM_HINT' || eMid.code === 'RATE_LIMIT' || eMid.code === 'UPSTREAM_TIMEOUT') && yielded && !sawTools && !continuationDone && curParent;
@@ -278,9 +280,23 @@ export class DsWebAdapter {
         if (!sawTools && !nudged && curParent && (sawTruncated || thinkOnly || (withTools && new RegExp('\\b(I\'?ll|I will|Let me|Now I|Now, let|First,? I|Next,? I|Then I|I need to|I must|Sekarang saya|akan saya|biar saya|perlu saya|Saya\\s+(?:akan\\s+)?(?:tambahkan|cek|lihat|periksa|patch|ubah|edit|cari|buka|tulis|buat|jalankan|coba|mau)|aku\\s+(?:akan\\s+)?(?:tambahkan|cek|coba|mau))\\b', 'i').test(partialAll)))) {
           nudged = true;
           const beforeN = callsEmitted;
-          const nbuf = [];
-          for await (const ev of consume(client.streamCompletion({ sessionId, prompt: thinkOnly ? ('Your previous response contained reasoning only, with no answer. Continue now: ' + (withTools ? 'emit ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '") or write your actual answer text.' : 'write your actual answer text now.') + ' Never reply with reasoning only.') : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE.'), thinkingEnabled: thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false)) nbuf.push(ev);
-          const ntxt = nbuf.filter((e) => e.type === 'text-delta').map((e) => e.text).join('').trim();
+          const maxRounds = thinkOnly ? 2 : 1;
+          let forceNoThink = false;
+          let nbuf = [];
+          let ntxt = '';
+          for (let nr = 0; nr < maxRounds; nr++) {
+            if (DBG) DBG.write('NUDGE r' + (nr + 1) + ' thinkOnly=' + thinkOnly + ' trunc=' + sawTruncated + '\n');
+            nbuf = [];
+            const nPrompt = (thinkOnly
+              ? ('Your previous response contained reasoning only, with no answer. Continue now: ' + (withTools ? 'emit ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '") or write your actual answer text.' : 'write your actual answer text now.') + ' Never reply with reasoning only.')
+              : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE.'))
+              + (forceNoThink ? ' Reply with final content only, no reasoning.' : '');
+            for await (const ev of consume(client.streamCompletion({ sessionId, prompt: nPrompt, thinkingEnabled: forceNoThink ? false : thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false)) nbuf.push(ev);
+            ntxt = nbuf.filter((e) => e.type === 'text-delta').map((e) => e.text).join('').trim();
+            if (callsEmitted > beforeN || (ntxt && !/^DONE\b/i.test(ntxt))) break;
+            forceNoThink = true;
+          }
+          if (DBG) DBG.write('NUDGE_END calls=' + (callsEmitted - beforeN) + ' txt=' + ntxt.length + '\n');
           if (callsEmitted > beforeN) { for (const ev of nbuf) yield ev; }
           else if (ntxt && !/^DONE\b/i.test(ntxt)) { yielded = true; yield { type: 'text-delta', text: ntxt }; }
         }
@@ -312,6 +328,7 @@ export class DsWebAdapter {
         yield { type: 'finish', reason: { kind: sawTools ? 'tool-calls' : 'stop' } };
         return;
       } catch (e) {
+        if (DBG) DBG.write('ERR ' + String((e && (e.code || e.message)) || e) + '\n');
         const isMuted = e && (e.code === 'USER_MUTED' || /muted|suspend/i.test(String(e && e.message || '')));
         const isAuth = e && (e.code === 40003 || /invalid token|authorization failed/i.test(String(e && e.message || '')));
         if (isMuted) this.store.markMuted(acct.id, e && e.muteUntil);

@@ -12,14 +12,15 @@ const asli = U.WebClient.prototype.createChatSession;
 const blk = '<' + Q + 'DSML' + Q + 'invoke name="cek"><' + Q + 'DSML' + Q + 'parameter name="q" string="true">halo</' + Q + 'DSML' + Q + 'parameter></' + Q + 'DSML' + Q + 'invoke>';
 async function run(gen) {
   const reqs = [];
+  const thinks = [];
   U.WebClient.prototype.createChatSession = async function () { return 's1'; };
-  U.WebClient.prototype.streamCompletion = async function* (o) { reqs.push(o.prompt); yield* gen(reqs.length, o); };
+  U.WebClient.prototype.streamCompletion = async function* (o) { reqs.push(o.prompt); thinks.push(o.thinkingEnabled); yield* gen(reqs.length, o); };
   let out = '', tool = null;
   for await (const ev of mk().stream({ messages: [{ role: 'user', content: 'kerja' }], model: 'deepseek-chat', thinking: false, search: false, tools: TOOLS })) {
     if (ev.type === 'text-delta') out += ev.text;
     if (ev.type === 'tool-call-delta') tool = (tool || '') + (ev.argumentsTextDelta || '');
   }
-  return { reqs, out, tool };
+  return { reqs, out, tool, thinks };
 }
 
 // 1) janji tanpa call -> nud sekali, call dari nud diterima
@@ -75,8 +76,21 @@ async function run(gen) {
     yield { type: 'meta', responseMessageId: 14 };
     yield { type: 'thinking', delta: 'Hmm...' };
   });
-  assert.equal(r5.reqs.length, 2);
+  assert.equal(r5.reqs.length, 3, 'main + 2 nud');
   assert.equal(r5.out, '');
+}
+
+
+// 6) reasoning-only dua kali -> ronde ke-2 packing thinkingEnabled:false
+{
+  const r6 = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 15 };
+    if (n <= 2) { yield { type: 'thinking', delta: 'Hmm...' }; return; }
+    yield { type: 'text', delta: 'Akhirnya jawab.' };
+  });
+  assert.equal(r6.reqs.length, 3, 'butuh 2 nud: ' + r6.reqs.length);
+  assert.equal(r6.thinks[2], false, 'ronde 3 harus thinking OFF');
+  assert.ok(r6.out.includes('Akhirnya jawab'), r6.out);
 }
 
 U.WebClient.prototype.createChatSession = asli;
