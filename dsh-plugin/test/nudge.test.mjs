@@ -76,7 +76,7 @@ async function run(gen) {
     yield { type: 'meta', responseMessageId: 14 };
     yield { type: 'thinking', delta: 'Hmm...' };
   });
-  assert.equal(r5.reqs.length, 4, 'main + 3 nud');
+  assert.equal(r5.reqs.length, 6, 'main + 5 nud (cap attempts)');
   assert.equal(r5.out, '');
 }
 
@@ -150,6 +150,18 @@ async function run(gen) {
   assert.equal(r11.reqs.length, 4, 'main + 3 nud: ' + r11.reqs.length);
   assert.ok(r11.reqs[3].includes('Do NOT write another plan sentence'), r11.reqs[3].slice(0, 120));
   assert.ok(!r11.out.includes('Akan saya lanjutkan'), r11.out);
+}
+
+// 12) ronde nud benar-benar kosong -> retry seketika, lalu call diterima
+{
+  const r12 = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 21 };
+    if (n === 1) { yield { type: 'text', delta: 'Saya cek dulu kondisinya ya.' }; return; }
+    if (n === 2) return;
+    yield { type: 'text', delta: blk };
+  });
+  assert.equal(r12.reqs.length, 3, 'harus retry setelah kosong: ' + r12.reqs.length);
+  assert.equal(r12.tool, JSON.stringify({ q: 'halo' }), r12.tool);
 }
 
 U.WebClient.prototype.createChatSession = asli;

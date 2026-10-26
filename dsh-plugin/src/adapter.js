@@ -287,28 +287,33 @@ export class DsWebAdapter {
         if (!sawTools && !nudged && curParent && (sawTruncated || thinkOnly || (withTools && plansMoreAction(partialAll)))) {
           nudged = true;
           const beforeN = callsEmitted;
-          const maxRounds = 3;
+          let nr = 0, attempts = 0, emptyStreak = 0;
           let forceNoThink = false;
           let nbuf = [];
           let ntxt = '';
-          for (let nr = 0; nr < maxRounds; nr++) {
-            if (DBG) DBG.write('NUDGE r' + (nr + 1) + ' thinkOnly=' + thinkOnly + ' trunc=' + sawTruncated + '\n');
+          while (attempts < 5) {
+            attempts++;
+            if (DBG) DBG.write('NUDGE r' + attempts + ' thinkOnly=' + thinkOnly + ' trunc=' + sawTruncated + '\n');
             nudgePass = true;
             nbuf = [];
             const nPrompt = (thinkOnly
-              ? ('Your previous response contained reasoning only, with no answer. Continue now: ' + (withTools ? 'emit ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '") or write your actual answer text.' : 'write your actual answer text now.') + ' Never reply with reasoning only. Never reply with just the _nonce value by itself, it is not an answer.')
-              : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE. Never reply with just the _nonce value by itself.'))
-              + (forceNoThink ? ' Reply with final content only, no reasoning.' : '')
+              ? ('Your previous response contained reasoning only, with no answer. Continue now: ' + (withTools ? 'emit ONLY the complete ｜DSML｜function_calls block (with the "_nonce" parameter set to "' + nonce + '") or write your actual answer text.' : 'write your actual answer text now.') + ' Never reply with reasoning only. Never reply with just the _nonce value by itself, it is not an answer.')
+              : ('You said you would take an action, but no tool block was emitted. If an action is still needed, reply with ' + (withTools ? 'ONLY the complete ｜DSML｜function_calls block (with the "_nonce" parameter set to "' + nonce + '")' : 'your answer') + '. If everything is already done, reply DONE. Never reply with just the _nonce value by itself.'))
+              + (forceNoThink ? ' Reply with final content only, no reasoning.' : '')
               + (nr >= 2 ? ' You replied with a plan already. Do NOT write another plan sentence: reply with ONLY the tool block now, or DONE.' : '');
             for await (const ev of consume(client.streamCompletion({ sessionId, prompt: nPrompt, thinkingEnabled: forceNoThink ? false : thinkingOn, searchEnabled: opts.search !== false, parentMessageId: curParent }), false)) nbuf.push(ev);
-            ntxt = nbuf.filter((e) => e.type === 'text-delta').map((e) => e.text).join('').trim();
+            const rawNtxt = nbuf.filter((e) => e.type === 'text-delta').map((e) => e.text).join('').trim();
+            ntxt = rawNtxt;
             if (ntxt && ntxt === String(nonce)) { if (DBG) DBG.write('DROP bare-nonce' + String.fromCharCode(10)); ntxt = ''; }
             else if (ntxt) ntxt = ntxt.replace(new RegExp('(?:' + String.fromCharCode(92) + 'r?' + String.fromCharCode(92) + 'n)+' + String.fromCharCode(92) + 's*' + nonce + String.fromCharCode(92) + 's*$'), '').trim();
-            const planAgain = ntxt && plansMoreAction(ntxt);
-            if (callsEmitted > beforeN || (ntxt && !/^DONE\b/i.test(ntxt) && !planAgain)) break;
-            if (planAgain && DBG) DBG.write('NUDGE plan-prose diabaikan\n');
+            if (callsEmitted > beforeN) break;
             if (/^DONE\b/i.test(ntxt)) break;
-            forceNoThink = true;
+            const planAgain = ntxt && plansMoreAction(ntxt);
+            if (ntxt && !planAgain) break;
+            if (planAgain && DBG) DBG.write('NUDGE plan-prose diabaikan' + String.fromCharCode(10));
+            const nAct = Boolean(rawNtxt) || nbuf.some((e) => e.type === 'reasoning-delta' || e.type === 'tool-call-delta');
+            if (!ntxt && !nAct && emptyStreak < 1) { emptyStreak++; if (DBG) DBG.write('NUDGE empty-retry' + String.fromCharCode(10)); continue; }
+            emptyStreak = 0; nr++; forceNoThink = true;
           }
           nudgePass = false;
           if (DBG) DBG.write('NUDGE_END calls=' + (callsEmitted - beforeN) + ' txt=' + ntxt.length + '\n');
