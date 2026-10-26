@@ -195,13 +195,15 @@ export class DsWebAdapter {
         let sawTruncated = false;
         let nudged = false;
         let hadThinking = false;
+        let nudgePass = false;
         function* emitCall(tc) {
           const k = callKey(tc);
-          if (seenCalls.has(k)) return;
+          if (seenCalls.has(k) && !nudgePass) { if (DBG) DBG.write('DROP dup ' + String(k).slice(0, 80) + '\n'); return; }
           let parsed = tc.parsedArguments;
           if (!parsed) { try { parsed = JSON.parse(tc.arguments || '{}'); } catch { parsed = null; } }
-          const chk = checkToolNonce(parsed, nonce);
-          if (!chk.ok) return;
+          let chk = checkToolNonce(parsed, nonce);
+          if (!chk.ok && nudgePass) { if (DBG) DBG.write('KEEP nonce-mismatch(nudge) ' + String(tc.name) + '\n'); const kept = Object.assign({}, chk.parsed); delete kept._nonce; chk = { ok: true, parsed: kept }; }
+          if (!chk.ok) { if (DBG) DBG.write('DROP nonce ' + String(tc.name) + '\n'); return; }
           seenCalls.add(k); sawTools = true; callsEmitted++;
           const coerced = coerceToolArgs(chk.parsed, toolSchemas.get(tc.name));
           yield { type: 'tool-call-delta', id: tc.id, name: tc.name, argumentsTextDelta: JSON.stringify(coerced ?? {}) };
@@ -286,6 +288,7 @@ export class DsWebAdapter {
           let ntxt = '';
           for (let nr = 0; nr < maxRounds; nr++) {
             if (DBG) DBG.write('NUDGE r' + (nr + 1) + ' thinkOnly=' + thinkOnly + ' trunc=' + sawTruncated + '\n');
+            nudgePass = true;
             nbuf = [];
             const nPrompt = (thinkOnly
               ? ('Your previous response contained reasoning only, with no answer. Continue now: ' + (withTools ? 'emit ONLY the complete \uff5cDSML\uff5cfunction_calls block (with the "_nonce" parameter set to "' + nonce + '") or write your actual answer text.' : 'write your actual answer text now.') + ' Never reply with reasoning only.')
@@ -296,6 +299,7 @@ export class DsWebAdapter {
             if (callsEmitted > beforeN || (ntxt && !/^DONE\b/i.test(ntxt))) break;
             forceNoThink = true;
           }
+          nudgePass = false;
           if (DBG) DBG.write('NUDGE_END calls=' + (callsEmitted - beforeN) + ' txt=' + ntxt.length + '\n');
           if (callsEmitted > beforeN) { for (const ev of nbuf) yield ev; }
           else if (ntxt && !/^DONE\b/i.test(ntxt)) { yielded = true; yield { type: 'text-delta', text: ntxt }; }

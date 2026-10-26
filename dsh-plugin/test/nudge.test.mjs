@@ -93,5 +93,17 @@ async function run(gen) {
   assert.ok(r6.out.includes('Akhirnya jawab'), r6.out);
 }
 
+// 8) nud membalas blok dgn _nonce salah (echo lama) -> tetap diterima, _nonce dibuang
+{
+  const blkBad = '<' + Q + 'DSML' + Q + 'invoke name="cek"><' + Q + 'DSML' + Q + 'parameter name="q" string="true">halo</' + Q + 'DSML' + Q + 'parameter><' + Q + 'DSML' + Q + 'parameter name="_nonce" string="true">nonce_lama_999</' + Q + 'DSML' + Q + 'parameter></' + Q + 'DSML' + Q + 'invoke>';
+  const r8 = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 16 };
+    if (n === 1) { yield { type: 'text', delta: 'Saya akan cek dulu ya.' }; return; }
+    yield { type: 'text', delta: blkBad };
+  });
+  assert.equal(r8.reqs.length, 2);
+  assert.equal(r8.tool, JSON.stringify({ q: 'halo' }), 'nonce salah harus tetap diterima di nud: ' + r8.tool);
+}
+
 U.WebClient.prototype.createChatSession = asli;
 console.log('OK nudge');
