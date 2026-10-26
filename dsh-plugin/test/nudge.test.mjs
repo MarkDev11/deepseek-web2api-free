@@ -76,7 +76,7 @@ async function run(gen) {
     yield { type: 'meta', responseMessageId: 14 };
     yield { type: 'thinking', delta: 'Hmm...' };
   });
-  assert.equal(r5.reqs.length, 3, 'main + 2 nud');
+  assert.equal(r5.reqs.length, 4, 'main + 3 nud');
   assert.equal(r5.out, '');
 }
 
@@ -123,6 +123,33 @@ async function run(gen) {
   assert.equal(r9.thinks[2], false, 'ronde 3 thinking OFF');
   assert.ok(r9.out.includes('Sudah saya ganti'), r9.out);
   assert.ok(!r9.out.includes(fixed), 'nonce tak boleh bocor: ' + r9.out);
+}
+
+// 10) nud membalas kalimat rencana lagi -> bukan jawaban; ronde 2 (thinking OFF) menghasilkan call
+{
+  const r10 = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 18 };
+    if (n === 1) { yield { type: 'text', delta: 'Sekarang saya ganti UI daftar token.' }; return; }
+    if (n === 2) { yield { type: 'text', delta: 'Sedang saya terapkan perbaikannya ke tiga file.' }; return; }
+    yield { type: 'text', delta: blk };
+  });
+  assert.equal(r10.reqs.length, 3, 'plan-prose bukan jawaban: ' + r10.reqs.length);
+  assert.equal(r10.thinks[2], false, 'ronde 3 thinking OFF');
+  assert.equal(r10.tool, JSON.stringify({ q: 'halo' }), r10.tool);
+  assert.ok(!r10.out.includes('Sedang saya terapkan'), 'plan-prose tak boleh keluar: ' + r10.out);
+}
+
+// 11) rencana terus sampai ronde 3 -> DONE menghentikan; hanya teks asli yang keluar
+{
+  const r11 = await run(async function* (n) {
+    yield { type: 'meta', responseMessageId: 19 };
+    if (n === 1) { yield { type: 'text', delta: 'Baik, sedang saya kerjakan sekarang.' }; return; }
+    if (n <= 3) { yield { type: 'text', delta: 'Akan saya lanjutkan segera.' }; return; }
+    yield { type: 'text', delta: 'DONE' };
+  });
+  assert.equal(r11.reqs.length, 4, 'main + 3 nud: ' + r11.reqs.length);
+  assert.ok(r11.reqs[3].includes('Do NOT write another plan sentence'), r11.reqs[3].slice(0, 120));
+  assert.ok(!r11.out.includes('Akan saya lanjutkan'), r11.out);
 }
 
 U.WebClient.prototype.createChatSession = asli;
