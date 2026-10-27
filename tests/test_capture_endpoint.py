@@ -34,11 +34,12 @@ def _post(payload) -> Request:
     }, receive=receive)
 
 
-def _get_request(token: str) -> Request:
+def _get_request(token: str, path: str = "/admin/api/capture-code",
+               query: bytes = b"") -> Request:
     return Request({
-        "type": "http", "method": "GET", "path": "/admin/api/capture-code",
+        "type": "http", "method": "GET", "path": path,
         "headers": [(b"authorization", f"Bearer {token}".encode())],
-        "query_string": b"",
+        "query_string": query,
     })
 
 
@@ -59,6 +60,7 @@ def pool(monkeypatch, tmp_path):
     monkeypatch.setattr(admin, "_pool", AccountPool())
     monkeypatch.setattr(admin, "_TOKEN_SECRET", b"unit-test-secret")
     admin._capture_attempts.clear()
+    admin._capture_tags.clear()
     yield admin._pool
 
 
@@ -150,4 +152,27 @@ def test_capture_code_requires_login(pool):
         admin._tokens.discard(token)
     with pytest.raises(HTTPException) as exc:
         asyncio.run(admin.capture_code(_get_request("bogus")))
+    assert exc.value.status_code == 401
+
+
+def test_capture_tag_becomes_visible_event(pool):
+    secret = admin._capture_secret()
+    asyncio.run(admin.capture(
+        _post({"raw": _blob(), "secret": secret, "tag": "t3tagtag"}), Response()))
+    token = _login()
+    try:
+        out = asyncio.run(admin.capture_events(
+            _get_request(token, "/admin/api/capture-events", b"tag=t3tagtag")))
+        assert out == {"seen": True}
+        out = asyncio.run(admin.capture_events(
+            _get_request(token, "/admin/api/capture-events", b"tag=nope-nope")))
+        assert out == {"seen": False}
+    finally:
+        admin._tokens.discard(token)
+
+
+def test_capture_events_requires_login(pool):
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(admin.capture_events(
+            _get_request("bogus", "/admin/api/capture-events", b"tag=x")))
     assert exc.value.status_code == 401

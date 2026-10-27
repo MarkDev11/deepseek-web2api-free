@@ -543,6 +543,8 @@ _CAPTURE_WINDOW = 60.0
 _CAPTURE_MAX = 10
 _capture_attempts: dict[str, list[float]] = {}
 _capture_lock = threading.Lock()
+# last capture tags accepted, newest last - tiny ring, no cleanup needed
+_capture_tags: deque[str] = deque(maxlen=100)
 
 
 def _capture_secret() -> str:
@@ -556,6 +558,10 @@ class CaptureRequest(BaseModel):
     raw: str
     secret: str
     email: str | None = ""
+    # one-time id chosen by the panel before it opens the login popup; when a
+    # capture carries it, the panel can ASK whether its user's credentials
+    # have arrived (GET /capture-events?tag=...) without trusting the popup.
+    tag: str | None = ""
 
 
 @router.get("/capture-code")
@@ -628,10 +634,24 @@ async def capture(request: Request, response: Response):
         except Exception as e:
             _pool_error(e)
         updated = False
-    # The bookmarklet runs on the chat.deepseek.com origin and the CORS
+    tag = (req.tag or "").strip()[:64]
+    if tag:
+        with _capture_lock:
+            _capture_tags.append(tag)
+    # The script runs on the chat.deepseek.com origin and the CORS
     # middleware stays strict by default - so this endpoint carries its own
     response.headers["Access-Control-Allow-Origin"] = "*"
     return {"ok": True, "updated": updated, "account": acct.to_dict()}
+
+
+@router.get("/capture-events")
+async def capture_events(request: Request):
+    """Did a capture with this tag arrive? The panel polls it while the
+    login popup is open - the popup is cross-origin, so this is the only
+    honest delivery signal."""
+    _check_auth(request)
+    tag = (request.query_params.get("tag") or "").strip()[:64]
+    return {"seen": bool(tag) and tag in _capture_tags}
 
 
 
