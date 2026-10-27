@@ -239,7 +239,7 @@ _stats = StatsSnapshot()
 _pool = AccountPool()
 
 # Kept in sync with server.app.version by tests/test_admin_env.py.
-SERVER_VERSION = "3.3.14"
+SERVER_VERSION = "3.3.15"
 
 
 def get_pool() -> AccountPool:
@@ -455,6 +455,8 @@ async def env_info(request: Request):
             "per_ip": int(os.environ.get("CLIENT_RPM_PER_IP", "120") or 120),
         },
         "session_cache_ttl": int(os.environ.get("SESSION_CACHE_TTL", "1800") or 1800),
+        "session_auto_match": (os.environ.get("SESSION_AUTO_MATCH") or "1").strip().lower() not in {"0", "false", "off", "no"},
+        "session_auto_sticky": (os.environ.get("SESSION_AUTO_STICKY") or "1").strip().lower() not in {"0", "false", "off", "no"},
         "log_level": os.environ.get("LOG_LEVEL", "INFO").upper(),
         "log_format": os.environ.get("LOG_FORMAT", "json").lower(),
         "dsml_max_buffer_bytes": int(os.environ.get("DSML_MAX_BUFFER_BYTES", "1048576") or 1048576),

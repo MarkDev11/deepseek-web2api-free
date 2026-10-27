@@ -12,9 +12,11 @@ client IP when unauthenticated) and an explicit conversation identifier.
 ``conversation_id`` resolution order (highest first):
   1. The OpenAI request's top-level ``user`` field (string).
   2. The Anthropic request's ``metadata.user_id`` field.
-  3. No cache entry.  Reusing an upstream session without an explicit
-     conversation id can join independent conversations that happen to have
-     the same opening message.
+  3. No cache entry - but since v3.3.15 the server adds an opt-outable
+     fallback (SESSION_AUTO_MATCH, see server.py): a turn without an id may
+     reuse the SAME caller's recent conversation when its prompt extends a
+     stored one, or (sticky) that caller's latest auto conversation.
+     Cross-caller joining stays impossible: matching is scoped per API key/IP.
 
 Cache value: ``ChatSession(chat_session_id, account_id, parent_message_id,
 msg_counters)``.  The account binding prevents a session created with one
@@ -52,6 +54,7 @@ def _env_int(name: str, default: int) -> int:
 SESSION_CACHE_TTL = _env_int("SESSION_CACHE_TTL", 1800)
 SESSION_CACHE_MAX = _env_int("SESSION_CACHE_MAX", 10_000)
 SWEEP_INTERVAL = 60  # seconds
+SCOPE_INDEX_MAX = 8  # recent auto-conversations remembered per caller scope
 
 
 def delta_prompt(prev: str, cur: str) -> str | None:
@@ -121,6 +124,8 @@ class SessionCache:
         self._lock = threading.Lock()
         self._data: OrderedDict[str, tuple[float, ChatSession]] = OrderedDict()
         self._last_sweep = 0.0
+        # scope -> most-recent-first list of auto-conversation keys
+        self._scope_keys: dict[str, list[str]] = {}
 
     @staticmethod
     def derive_conversation_id(user_id: str | None, metadata: dict | None) -> str | None:
@@ -176,6 +181,57 @@ class SessionCache:
     def invalidate(self, key: str) -> None:
         with self._lock:
             self._data.pop(key, None)
+
+    def note_scope_key(self, scope: str, key: str) -> None:
+        """Remember a conversation key among the caller scope's recent chats."""
+        if not scope or not key:
+            return
+        with self._lock:
+            keys = self._scope_keys.setdefault(scope, [])
+            if key in keys:
+                keys.remove(key)
+            keys.insert(0, key)
+            if len(keys) > SCOPE_INDEX_MAX:
+                del keys[SCOPE_INDEX_MAX:]
+
+    def auto_match(self, scope: str, prompt: str, sticky: bool = False) -> str | None:
+        """Find the cached conversation this resent prompt continues.
+
+        Agent harnesses resend the full history every turn but rarely send a
+        conversation id; without a match each turn burns a brand-new upstream
+        chat session (a wall of near-duplicate chats in the account history).
+        The longest stored prompt that is a prefix of this one wins, so the
+        reuse goes through the existing delta path.  With "sticky" on, a
+        caller whose chain broke (context compaction, edited history) is
+        placed on its most recent auto conversation instead of starting a
+        new one - one thread per caller beats one chat per turn.
+        """
+        if not self._ttl or not scope or not prompt:
+            return None
+        now = time.time()
+        with self._lock:
+            keys = self._scope_keys.get(scope)
+            if not keys:
+                return None
+            best_key: str | None = None
+            best_len = -1
+            latest: str | None = None
+            dead: list[str] = []
+            for k in keys:
+                entry = self._data.get(k)
+                if entry is None or entry[0] <= now:
+                    dead.append(k)
+                    continue
+                if latest is None:
+                    latest = k
+                sent = entry[1].sent_prompt
+                if sent and prompt.startswith(sent) and len(sent) > best_len:
+                    best_key, best_len = k, len(sent)
+            for k in dead:
+                keys.remove(k)
+            if best_key is not None:
+                return best_key
+            return latest if sticky else None
 
     def _maybe_sweep(self) -> None:
         now = time.time()

@@ -211,7 +211,7 @@ def _check_rate_limit(request: Request) -> dict:
     return headers
 
 
-app = FastAPI(title="DeepSeek Chat API", version="3.3.14")
+app = FastAPI(title="DeepSeek Chat API", version="3.3.15")
 
 # ── CORS ─────────────────────────────────────────────────────────────
 # Empty ALLOWED_ORIGINS ⇒ same-origin only. We deliberately do NOT set
@@ -643,6 +643,44 @@ def _cache_key(request: Request, conversation_id: str | None,
     return f"conv:{derived}" if derived else None
 
 
+# ---- Automatic conversation continuity (v3.3.15) ----
+# Agent harnesses (DeepSeek Harness via the dsh-plugin, opencode, plain SDK
+# scripts...) resend the full message history every turn but never send a
+# conversation id, so every turn used to open a brand-new DeepSeek chat and
+# the account history became a wall of sessions ("ngespam sesi baru").  With
+# this enabled a turn WITHOUT an explicit id is matched against the same
+# caller's recent auto-conversations: a prompt that EXTENDS a stored turn
+# reuses that session (delta path), and with SESSION_AUTO_STICKY a turn that
+# no longer extends any stored history (context compaction, edited history)
+# still lands on the caller's most recent auto session - one thread per
+# caller instead of one chat per turn.  Multi-tenant deployments that share
+# one API key across unrelated users should set SESSION_AUTO_MATCH=0.
+SESSION_AUTO_MATCH = (os.environ.get("SESSION_AUTO_MATCH") or "1").strip().lower() not in {"0", "false", "off", "no"}
+SESSION_AUTO_STICKY = (os.environ.get("SESSION_AUTO_STICKY") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _auto_cache_key(request: Request, prompt: str) -> str | None:
+    """Resolve - or mint - an automatic conversation key for this caller."""
+    if not SESSION_AUTO_MATCH or not prompt:
+        return None
+    scope = _cache_scope(request)
+    hit = SESSION_CACHE.auto_match(scope, prompt, sticky=SESSION_AUTO_STICKY)
+    if hit:
+        return hit
+    key = SessionCache.derive_cache_key(scope, f"auto:{uuid.uuid4().hex}")
+    SESSION_CACHE.note_scope_key(scope, key)
+    return key
+
+
+def _resolve_cache_key(request: Request, conversation_id: str | None,
+                       prompt: str) -> str | None:
+    """Explicit conversation id first; automatic continuity as fallback."""
+    key = _cache_key(request, conversation_id)
+    if key is not None:
+        return key
+    return _auto_cache_key(request, prompt)
+
+
 def _extract_openai_user(req: ChatCompletionRequest, request: Request) -> str | None:
     """Derive a per-conversation cache key for the OpenAI endpoint.
 
@@ -836,7 +874,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # not silently start a brand-new upstream session (it used to, because the
     # key was prefixed with stream:/nonstream:).
     openai_user = _extract_openai_user(req, request)
-    cache_key = _cache_key(request, openai_user)
+    cache_key = _resolve_cache_key(request, openai_user, prompt)
     if req.stream:
         return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search, rate_headers=rate_headers,
                                     cache_key=cache_key)
@@ -881,7 +919,7 @@ async def messages(req: AnthropicRequest, request: Request):
                 tool_names.append(t.name)
 
     anth_user = _extract_anthropic_user(req, request)
-    cache_key = _cache_key(request, anth_user)
+    cache_key = _resolve_cache_key(request, anth_user, prompt)
     if req.stream:
         return await _anthropic_stream(proxy_id, prompt, tool_names,
                                        model_type=model_type, thinking_mode=thinking,
