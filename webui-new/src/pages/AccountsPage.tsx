@@ -84,43 +84,12 @@ export default function AccountsPage() {
       // and ds_session_id is HttpOnly). So guide the one-paste flow: open
       // the tab, pre-copy the console command, open Quick import.
       if (e instanceof ApiCallError && e.status === 400) {
-        // Hosted panel cannot open a browser, but a local helper can:
-        //   node dsh-plugin/scripts/login-helper.mjs
-        // It opens the small OAuth-style window, captures via CDP, and we
-        // add the result to THIS (hosted) pool over the admin API.
-        const LOCAL_HELPER = 'http://127.0.0.1:55343'
-        try {
-          const h = await fetch(LOCAL_HELPER + '/login', {
-            method: 'POST',
-            signal: AbortSignal.timeout(610_000),
-          })
-          if (h.status === 409) {
-            toast({ title: 'Login in progress', description: 'A login window is already open on this machine - finish that one first.', variant: 'destructive' })
-            return
-          }
-          if (!h.ok) throw new Error('helper responded HTTP ' + h.status)
-          const cap = (await h.json()) as {
-            ok: boolean
-            error?: string
-            account?: { token?: string; cookies?: string; email?: string; id?: string }
-          }
-          if (!cap.ok || !cap.account?.token) throw new Error(cap.error || 'helper returned no token')
-          const created = await post<{ account: Account }>('/admin/api/accounts', {
-            raw: cap.account.token + '||' + (cap.account.cookies || ''),
-            email: cap.account.email || undefined,
-          })
-          toast({
-            title: 'Account added',
-            description: created.account.email || created.account.id,
-            variant: 'success',
-          })
-          refresh()
-          return
-        } catch (he) {
-          // Helper not running (or refused): fall through to guided paste.
-          console.warn('dsweb login helper unavailable:', he)
-        }
-        window.open('https://chat.deepseek.com/', '_blank', 'noopener')
+        // Popup window (not a tab), OAuth-style: small and focused.
+        window.open(
+          'https://chat.deepseek.com/',
+          'dsweb_login',
+          'width=480,height=760,left=120,top=90',
+        )
         void navigator.clipboard
           ?.writeText("copy(JSON.parse(localStorage.userToken).value + '||' + document.cookie)")
           .catch(() => undefined)
