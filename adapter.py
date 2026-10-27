@@ -303,6 +303,15 @@ class RateLimitError(UpstreamHintError):
     '消息发送过于频繁，请稍后重试'). Maps to HTTP 429 on the server side."""
 
 
+class UpstreamParentError(UpstreamEmptyError):
+    """Upstream rejected the parent message id (biz_code 26, "invalid
+    message id"): the cached session thread tip is gone. Handled like an
+    empty response - retry once on a fresh session without a parent -
+    mirroring the dsh-plugin WebClient, which drops the poisoned session
+    before its retry (UPSTREAM_PARENT).
+    """
+
+
 class UserMutedError(RateLimitError):
     """The upstream answered with ``biz_msg: "user is muted"`` (biz_code 5)
     — an account-level penalty, not a protocol issue. The body is a plain
@@ -343,6 +352,34 @@ def _mute_msg(raw) -> str | None:
                 until = ""
         return f"上游账号已静音：{biz_msg or 'user is muted'}{until}"
     return None
+
+
+def _biz_envelope(raw) -> tuple[int | None, str]:
+    """Return ``(biz_code, biz_msg)`` from a plain-JSON upstream body.
+
+    Mirrors the dsh-plugin WebClient, which inspects the non-SSE 200
+    envelope for biz_code 4 (rate limit), 5 (mute, see _mute_msg) and 26
+    (invalid parent message id) before treating the body as content.
+    """
+    if not isinstance(raw, dict):
+        return None, ""
+    d = raw.get("data")
+    if not isinstance(d, dict):
+        return None, ""
+    code = d.get("biz_code")
+    try:
+        code = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code = None
+    return code, str(d.get("biz_msg") or "")
+
+
+def _is_parent_rejection(code: int | None, msg: str) -> bool:
+    return code == 26 or bool(re.search(r"invalid message id", msg, re.IGNORECASE))
+
+
+def _is_json_rate_limit(code: int | None, msg: str) -> bool:
+    return code == 4 or bool(re.search(r"频繁|frequent|too many", msg, re.IGNORECASE))
 
 
 # Upstream hif signature headers: the browser fetches these from dedicated
@@ -497,7 +534,7 @@ class DeepSeekAdapter:
         # so cf_clearance / AWS WAF tokens stay fresh across calls.
         self._client = cffi_requests.Session(
             impersonate=impersonate,
-            timeout=120,
+            timeout=600,
             proxies={"all": proxy} if proxy else None,
         )
         # Best-effort hif signature headers (see _HifProvider); never
@@ -953,7 +990,7 @@ class DeepSeekAdapter:
         else:
             client = cffi_requests.Session(
                 impersonate=self.impersonate,
-                timeout=120,
+                timeout=600,
                 proxies={"all": self.proxy} if self.proxy else None,
             )
         resp = client.post(
@@ -1047,6 +1084,13 @@ class DeepSeekAdapter:
         mute = _mute_msg(raw) if isinstance(raw, dict) else None
         if mute:
             raise UserMutedError(mute)
+        # Parity with the plugin non-SSE branch: a rejected parent id or a
+        # plain-JSON rate limit must not masquerade as an empty response.
+        code, msg = _biz_envelope(raw)
+        if _is_parent_rejection(code, msg):
+            raise UpstreamParentError(f"上游拒绝了 parent message id：{msg or 'invalid message id'}")
+        if _is_json_rate_limit(code, msg):
+            raise RateLimitError(f"上游限流：{msg or 'biz_code 4'}", "rate_limit")
 
         events = self._parse_sse(resp.text)
 
@@ -1316,6 +1360,11 @@ class DeepSeekAdapter:
                 mute = _mute_msg(data)
                 if mute:
                     raise UserMutedError(mute)
+                code, msg = _biz_envelope(data)
+                if _is_parent_rejection(code, msg):
+                    raise UpstreamParentError(f"上游拒绝了 parent message id：{msg or 'invalid message id'}")
+                if _is_json_rate_limit(code, msg):
+                    raise RateLimitError(f"上游限流：{msg or 'biz_code 4'}", "rate_limit")
 
                 # Upstream may reject with a `toast` event of type=error
                 # (issue #8). Surface it as a real error so the SSE
