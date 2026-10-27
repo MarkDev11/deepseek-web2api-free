@@ -3,6 +3,7 @@ Admin API — authentication, statistics tracking, account pool management.
 """
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import threading
@@ -564,29 +565,47 @@ async def capture_code(request: Request):
     return {"enabled": bool(secret), "secret": secret}
 
 
+def _capture_error(status: int, detail: str) -> HTTPException:
+    # Error answers carry the CORS header too: without it the bookmarklet
+    # sees only an opaque failure and cannot tell the user WHY (bad secret,
+    # rate limit, disabled...).
+    return HTTPException(status_code=status, detail=detail,
+                         headers={"Access-Control-Allow-Origin": "*"})
+
+
 @router.post("/capture")
-async def capture(req: CaptureRequest, request: Request, response: Response):
-    """Public one-click capture (no admin session): bookmarklet -> pool."""
+async def capture(request: Request, response: Response):
+    """Public one-click capture (no admin session): bookmarklet -> pool.
+
+    The body is parsed manually on purpose: the bookmarklet sends a
+    "simple" CORS POST (content-type text/plain, so the browser skips the
+    preflight) and FastAPI would not read a JSON model out of that
+    content-type by itself.
+    """
     secret = _capture_secret()
     if not secret:
-        raise HTTPException(status_code=503,
-                            detail="capture disabled: set ADMIN_TOKEN_SECRET or DEEPSEEK_ENCRYPTION_KEY")
+        raise _capture_error(503,
+            "capture disabled: set ADMIN_TOKEN_SECRET or DEEPSEEK_ENCRYPTION_KEY")
+    try:
+        req = CaptureRequest(**json.loads(await request.body()))
+    except Exception:
+        raise _capture_error(400, "body must be JSON with fields raw and secret")
     if not hmac.compare_digest(secret, (req.secret or "").strip()[:128]):
-        raise HTTPException(status_code=401, detail="bad capture secret")
+        raise _capture_error(401, "bad capture secret")
     now = time.time()
     ip = _client_ip(request)
     with _capture_lock:
         attempts = [t for t in _capture_attempts.get(ip, []) if now - t < _CAPTURE_WINDOW]
         if len(attempts) >= _CAPTURE_MAX:
-            raise HTTPException(status_code=429, detail="too many captures, wait a minute")
+            raise _capture_error(429, "too many captures, wait a minute")
         attempts.append(now)
         _capture_attempts[ip] = attempts
     raw = (req.raw or "").strip()
     if not raw or len(raw) > 16384:
-        raise HTTPException(status_code=400, detail="empty or oversized payload")
+        raise _capture_error(400, "empty or oversized payload")
     token, cookies = parse_credential_blob(raw, "", "")
     if not token or not cookies:
-        raise HTTPException(status_code=400, detail="token and cookies could not be read from the payload")
+        raise _capture_error(400, "token and cookies could not be read from the payload")
     pool = get_pool()
     # Same token already in the pool = a known account re-logging in:
     # rotate its cookies, never create a duplicate entry.
@@ -611,8 +630,6 @@ async def capture(req: CaptureRequest, request: Request, response: Response):
         updated = False
     # The bookmarklet runs on the chat.deepseek.com origin and the CORS
     # middleware stays strict by default - so this endpoint carries its own
-    # Access-Control-Allow-Origin. The bookmarklet sends text/plain (a
-    # "simple" POST), so there is no preflight either.
     response.headers["Access-Control-Allow-Origin"] = "*"
     return {"ok": True, "updated": updated, "account": acct.to_dict()}
 
