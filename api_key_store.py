@@ -1,7 +1,10 @@
 """Persistent client API-key management.
 
-Only SHA-256 hashes are stored. Newly generated key material is returned once
-to the caller and is never recoverable from the database.
+Authentication checks the SHA-256 hash. Since v3.3.18 the full key material
+is stored alongside (Fernet-encrypted when DEEPSEEK_ENCRYPTION_KEY is set,
+plain with a marker otherwise) so the WebUI can offer a copy button at any
+time, not just once at creation; the material leaves the server only through
+the admin-authenticated reveal endpoint.
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ import time
 from pathlib import Path
 
 import credential_store
+import crypto
 from logger import get_logger
 
 log = get_logger("api_key_store")
@@ -129,6 +133,34 @@ class ApiKeyStore:
             return key[:8]
         return f"legacy-{cls._key_hash(key)[:8]}"
 
+    @staticmethod
+    def _protect_material(key: str) -> str:
+        """At-rest form of the full key. Fernet when configured; otherwise a
+        plain marker - the material is only ever returned by the admin-only
+        reveal endpoint, the same trust level as the admin password."""
+        try:
+            if crypto.is_enabled():
+                return "enc:" + crypto.encrypt_str(key)
+        except Exception as exc:
+            log.warning("api_key_material_encrypt_failed", extra={"error": str(exc)})
+        return "raw:" + key
+
+    @staticmethod
+    def _reveal_material(material: str | None) -> str | None:
+        if not material:
+            return None
+        if material.startswith("enc:"):
+            try:
+                return crypto.decrypt_str(material[4:])
+            except Exception as exc:
+                # Wrong or rotated DEEPSEEK_ENCRYPTION_KEY: the hash still
+                # authenticates the key, only the copy feature degrades.
+                log.warning("api_key_material_decrypt_failed", extra={"error": str(exc)})
+                return None
+        if material.startswith("raw:"):
+            return material[4:]
+        return material
+
     @classmethod
     def _insert_key(
         cls,
@@ -139,14 +171,15 @@ class ApiKeyStore:
     ) -> None:
         conn.execute(
             """INSERT OR IGNORE INTO api_keys
-               (id, name, key_hash, key_prefix, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
+               (id, name, key_hash, key_prefix, created_at, key_material)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             (
                 secrets.token_hex(8),
                 name,
                 cls._key_hash(key),
                 cls._prefix(key),
                 created_at,
+                cls._protect_material(key),
             ),
         )
 
@@ -161,9 +194,16 @@ class ApiKeyStore:
                     name TEXT NOT NULL,
                     key_hash TEXT NOT NULL UNIQUE,
                     key_prefix TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL,
+                    key_material TEXT
                 )"""
             )
+            # Pre-v3.3.18 databases lack the material column; old rows stay
+            # NULL (not revealable) - everything created from now on is.
+            try:
+                conn.execute("ALTER TABLE api_keys ADD COLUMN key_material TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS api_key_store_meta (
                     name TEXT PRIMARY KEY,
@@ -204,7 +244,7 @@ class ApiKeyStore:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, name, key_hash, key_prefix, created_at FROM api_keys"
+                "SELECT id, name, key_hash, key_prefix, created_at, key_material FROM api_keys"
             ).fetchall()
             return [dict(row) for row in rows]
         finally:
@@ -217,10 +257,11 @@ class ApiKeyStore:
             for rec in records:
                 conn.execute(
                     """INSERT OR REPLACE INTO api_keys
-                       (id, name, key_hash, key_prefix, created_at)
-                       VALUES (?, ?, ?, ?, ?)""",
+                       (id, name, key_hash, key_prefix, created_at, key_material)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
                     (rec["id"], rec["name"], rec["key_hash"],
-                     rec.get("key_prefix") or rec["key_hash"][:16], int(rec.get("created_at") or 0)),
+                     rec.get("key_prefix") or rec["key_hash"][:16], int(rec.get("created_at") or 0),
+                     rec.get("key_material")),
                 )
             conn.commit()
             return len(records)
@@ -317,13 +358,14 @@ class ApiKeyStore:
             "name": row["name"],
             "prefix": row["key_prefix"],
             "created_at": row["created_at"],
+            "revealable": ("key_material" in row.keys() and bool(row["key_material"])),
         }
 
     def list_keys(self) -> list[dict]:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, name, key_prefix, created_at FROM api_keys "
+                "SELECT id, name, key_prefix, created_at, key_material FROM api_keys "
                 "ORDER BY created_at DESC, id DESC"
             ).fetchall()
             return [self._public_record(row) for row in rows]
@@ -364,19 +406,20 @@ class ApiKeyStore:
         try:
             conn.execute(
                 """INSERT INTO api_keys
-                   (id, name, key_hash, key_prefix, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (id, name, key_hash, key_prefix, created_at, key_material)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     secrets.token_hex(8),
                     normalized_name,
                     self._key_hash(key),
                     self._prefix(key),
                     created_at,
+                    self._protect_material(key),
                 ),
             )
             conn.commit()
             row = conn.execute(
-                "SELECT id, name, key_prefix, created_at FROM api_keys WHERE key_hash = ?",
+                "SELECT id, name, key_prefix, created_at, key_material FROM api_keys WHERE key_hash = ?",
                 (self._key_hash(key),),
             ).fetchone()
             result = {"key": key, "api_key": self._public_record(row)}
@@ -385,6 +428,18 @@ class ApiKeyStore:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def reveal_key(self, key_id: str) -> str | None:
+        """Full key for the WebUI copy button. None when the row predates
+        key-material storage or decryption fails (rotated encryption key)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT key_material FROM api_keys WHERE id = ?", (key_id,)
+            ).fetchone()
+            return self._reveal_material(row["key_material"]) if row else None
         finally:
             conn.close()
 

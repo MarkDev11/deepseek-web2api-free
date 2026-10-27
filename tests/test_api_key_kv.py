@@ -137,3 +137,14 @@ def test_kv_status_shape(tmp_path, kv):
     status = api_key_store.kv_status()
     assert status["enabled"] is True
     assert status["key"] == "ds2api:api_keys.json"
+
+def test_reveal_material_survives_kv_round_trip(tmp_path, kv):
+    kv()
+    instance_a = ApiKeyStore(tmp_path / "a.sqlite3")
+    created = instance_a.create_key("shared")
+
+    # Fresh instance hydrates purely from KV - material included.
+    instance_b = ApiKeyStore(tmp_path / "b.sqlite3")
+    record = next(r for r in instance_b.list_keys() if r["name"] == "shared")
+    assert record["revealable"] is True
+    assert instance_b.reveal_key(record["id"]) == created["key"]

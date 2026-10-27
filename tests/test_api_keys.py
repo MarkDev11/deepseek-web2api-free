@@ -69,14 +69,15 @@ def test_legacy_keys_import_only_once_and_store_hashes(tmp_path):
         "SELECT name FROM pragma_table_info('api_keys') ORDER BY cid"
     ).fetchall()
     assert [row[0] for row in rows] == [
-        "id", "name", "key_hash", "key_prefix", "created_at"
+        "id", "name", "key_hash", "key_prefix", "created_at", "key_material"
     ]
-    db_bytes = b"".join(
-        path.read_bytes()
-        for path in tmp_path.glob("legacy.sqlite3*")
-        if path.is_file()
-    )
-    assert all(key.encode() not in db_bytes for key in legacy_keys)
+    # v3.3.18: full key material is deliberately stored (marker-prefixed) so
+    # the WebUI copy button keeps working; the reveal path returns it verbatim.
+    for rec in store.list_keys():
+        assert rec["revealable"] is True
+    assert sorted(
+        store.reveal_key(rec["id"]) for rec in store.list_keys()
+    ) == sorted(legacy_keys)
 
 
 def test_generated_key_is_verifiable_and_only_returned_at_creation(api_key_store):
@@ -87,7 +88,7 @@ def test_generated_key_is_verifiable_and_only_returned_at_creation(api_key_store
     assert key.startswith("sk-")
     assert len(key) > 40
     assert record["name"] == "local client"
-    assert set(record) == {"id", "name", "prefix", "created_at"}
+    assert set(record) == {"id", "name", "prefix", "created_at", "revealable"}
     assert record["prefix"] == key[:8]
     assert api_key_store.verify(key)
     assert not api_key_store.verify("sk-invalid")
@@ -225,3 +226,110 @@ class TestStorePathFallback:
         store = api_key_store.get_api_key_store()
 
         assert store.path == target and target.exists()
+
+
+class TestRevealKey:
+    """v3.3.18: the full key material is stored (encrypted when possible)
+    so the WebUI can offer a permanent copy button."""
+
+    def test_created_key_is_revealable(self, api_key_store):
+        created = api_key_store.create_key("copy-me")
+        record = api_key_store.list_keys()[0]
+        assert record["revealable"] is True
+        assert api_key_store.reveal_key(record["id"]) == created["key"]
+
+    def test_unknown_id_reveals_nothing(self, api_key_store):
+        assert api_key_store.reveal_key("missing") is None
+
+    def test_fernet_round_trip_hides_plaintext_on_disk(self, tmp_path, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        monkeypatch.setenv("DEEPSEEK_ENCRYPTION_KEY", Fernet.generate_key().decode())
+        db = tmp_path / "enc.sqlite3"
+        store = ApiKeyStore(db)
+        created = store.create_key("encrypted")
+
+        record = store.list_keys()[0]
+        assert store.reveal_key(record["id"]) == created["key"]
+
+        material = sqlite3.connect(db).execute(
+            "SELECT key_material FROM api_keys"
+        ).fetchone()[0]
+        assert material.startswith("enc:")
+        assert created["key"] not in material
+
+    def test_rotated_encryption_key_degrades_to_none(self, tmp_path, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        monkeypatch.setenv("DEEPSEEK_ENCRYPTION_KEY", Fernet.generate_key().decode())
+        store = ApiKeyStore(tmp_path / "rot.sqlite3")
+        created = store.create_key("rotated")
+        monkeypatch.setenv("DEEPSEEK_ENCRYPTION_KEY", Fernet.generate_key().decode())
+
+        record = store.list_keys()[0]
+        assert store.verify(created["key"]) is True  # auth unaffected
+        assert store.reveal_key(record["id"]) is None  # only copy degrades
+
+    def test_pre_v3318_schema_migrates_and_stays_unrevealable(self, tmp_path):
+        db = tmp_path / "old.sqlite3"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """CREATE TABLE api_keys (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                key_hash TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO api_keys VALUES ('old-1', 'veteran', 'hash-1', 'sk-old', 1)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = ApiKeyStore(db)
+        veteran = store.list_keys()[0]
+        assert veteran["revealable"] is False
+        assert store.reveal_key("old-1") is None
+
+        created = store.create_key("post-migration")
+        new = next(r for r in store.list_keys() if r["name"] == "post-migration")
+        assert new["revealable"] is True
+        assert store.reveal_key(new["id"]) == created["key"]
+
+    def test_reveal_route_returns_key_and_requires_auth(self, admin_client):
+        client, store, token = admin_client
+        headers = {"Authorization": f"Bearer {token}"}
+
+        created = client.post(
+            "/admin/api/api-keys", json={"name": "reveal-route"}, headers=headers
+        ).json()
+        key_id = created["api_key"]["id"]
+
+        revealed = client.get(f"/admin/api/api-keys/{key_id}/reveal", headers=headers)
+        assert revealed.status_code == 200
+        assert revealed.json() == {"key": created["key"]}
+        assert revealed.headers["cache-control"] == "no-store"
+
+        anonymous = client.get(f"/admin/api/api-keys/{key_id}/reveal")
+        assert anonymous.status_code in (401, 403)
+
+        missing = client.get("/admin/api/api-keys/nope/reveal", headers=headers)
+        assert missing.status_code == 404
+
+    def test_reveal_route_reports_legacy_as_not_recoverable(self, admin_client):
+        client, store, token = admin_client
+        headers = {"Authorization": f"Bearer {token}"}
+
+        conn = sqlite3.connect(store.path)
+        conn.execute(
+            "INSERT INTO api_keys (id, name, key_hash, key_prefix, created_at, key_material)"
+            " VALUES ('legacy-row', 'veteran', 'h', 'sk-v', 1, NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        response = client.get("/admin/api/api-keys/legacy-row/reveal", headers=headers)
+        assert response.status_code == 404
+        assert "recreate" in response.json()["detail"].lower()

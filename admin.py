@@ -240,7 +240,7 @@ _stats = StatsSnapshot()
 _pool = AccountPool()
 
 # Kept in sync with server.app.version by tests/test_admin_env.py.
-SERVER_VERSION = "3.3.17"
+SERVER_VERSION = "3.3.18"
 
 
 def get_pool() -> AccountPool:
@@ -363,6 +363,20 @@ async def create_api_key(req: ApiKeyCreateRequest, request: Request, response: R
         return get_api_key_store().create_key(req.name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api-keys/{key_id}/reveal")
+async def reveal_api_key(key_id: str, request: Request, response: Response):
+    """Full key material for the copy button - admin-authenticated only."""
+    _check_auth(request)
+    response.headers["Cache-Control"] = "no-store"
+    key = get_api_key_store().reveal_key(key_id)
+    if key is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Full key not recoverable; it predates key-copy support. Revoke and recreate it.",
+        )
+    return {"key": key}
 
 
 @router.delete("/api-keys/{key_id}")

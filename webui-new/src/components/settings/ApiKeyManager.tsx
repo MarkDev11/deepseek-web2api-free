@@ -12,6 +12,7 @@ interface ApiKeyRecord {
   name: string
   prefix: string
   created_at: number
+  revealable: boolean
 }
 
 interface ApiKeyListResponse {
@@ -29,6 +30,7 @@ export function ApiKeyManager() {
   const [newKey, setNewKey] = useState<string | null>(null)
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   const [revokingId, setRevokingId] = useState<string | null>(null)
+  const [copyingId, setCopyingId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [creating, setCreating] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -94,6 +96,20 @@ export function ApiKeyManager() {
     }
   }
 
+  async function copyExistingKey(key: ApiKeyRecord) {
+    setCopyingId(key.id)
+    try {
+      const result = await get<{ key: string }>('/admin/api/api-keys/' + encodeURIComponent(key.id) + '/reveal')
+      await navigator.clipboard.writeText(result.key)
+      toast({ title: 'API key copied', description: key.name })
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e)
+      toast({ title: 'Could not copy this key', description: message, variant: 'destructive' })
+    } finally {
+      setCopyingId(null)
+    }
+  }
+
   async function copyKey() {
     if (!newKey) return
     try {
@@ -118,7 +134,7 @@ export function ApiKeyManager() {
               Client API keys
             </CardTitle>
             <CardDescription>
-              Create a separate key for each client; the full value is shown only once after creation, and the server stores only its hash.
+              Create a separate key for each client. The full value is stored encrypted server-side, so you can copy it again at any time with the copy button.
             </CardDescription>
           </div>
           <Badge variant="secondary">{keys.length} total</Badge>
@@ -143,7 +159,7 @@ export function ApiKeyManager() {
 
         {newKey && (
           <div className="space-y-2 rounded-md border border-primary/30 bg-primary/5 p-3">
-            <div className="text-sm font-medium">The new key is shown only once — copy and save it now.</div>
+            <div className="text-sm font-medium">New key created — you can also copy it later from the list below.</div>
             <div className="flex flex-col gap-2 sm:flex-row">
               <Input value={newKey} readOnly className="font-mono text-xs select-all" aria-label="Newly generated API key" />
               <Button variant="outline" onClick={() => void copyKey()}>
@@ -172,6 +188,29 @@ export function ApiKeyManager() {
                     <code className="font-mono">{key.prefix}…</code>
                     <span>Created {new Date(key.created_at * 1000).toLocaleString()}</span>
                   </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  {key.revealable ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="text-muted-foreground hover:text-foreground"
+                      onClick={() => void copyExistingKey(key)}
+                      disabled={copyingId === key.id}
+                      aria-label={'Copy ' + key.name}
+                      title="Copy the full key"
+                    >
+                      <Copy className="h-4 w-4" />
+                      {copyingId === key.id ? 'Copying…' : 'Copy'}
+                    </Button>
+                  ) : (
+                    <span
+                      className="text-xs text-muted-foreground"
+                      title="This key was created before keys became copyable. Revoke it and create a new one to get a copy button."
+                    >
+                      not copyable
+                    </span>
+                  )}
                 </div>
                 {confirmingId === key.id ? (
                   <div className="flex shrink-0 items-center gap-2">
