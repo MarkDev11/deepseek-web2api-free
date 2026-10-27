@@ -211,7 +211,7 @@ def _check_rate_limit(request: Request) -> dict:
     return headers
 
 
-app = FastAPI(title="DeepSeek Chat API", version="3.3.15")
+app = FastAPI(title="DeepSeek Chat API", version="3.3.16")
 
 # ── CORS ─────────────────────────────────────────────────────────────
 # Empty ALLOWED_ORIGINS ⇒ same-origin only. We deliberately do NOT set
@@ -521,6 +521,10 @@ class AcquiredAccount:
             )
             return full_prompt
         if delta != full_prompt:
+            # v3.3.16: the echoed assistant reply inside the tail lives in
+            # the upstream session already; send only the newest message,
+            # like the web client does.
+            delta = _strip_echoed_history(delta)
             log.debug(
                 "session_prompt_delta",
                 extra={"session_id": cached.chat_session_id, "delta_chars": len(delta)},
@@ -670,6 +674,27 @@ def _auto_cache_key(request: Request, prompt: str) -> str | None:
     key = SessionCache.derive_cache_key(scope, f"auto:{uuid.uuid4().hex}")
     SESSION_CACHE.note_scope_key(scope, key)
     return key
+
+
+def _strip_echoed_history(delta: str) -> str:
+    """Drop echoed blocks the continued upstream session already holds.
+
+    On the continuation path the cached DeepSeek session already contains
+    its own previous reply - the parent chain points right at it, and the
+    real web client never resends it either: its completion request carries
+    only the newest message.  The echo is removed only when the boundary is
+    unambiguous: the tail must START with an assistant block and hold
+    exactly one line-start "User: " marker.  Otherwise text inside the
+    echo (a quoted conversation, a pasted log) or a second new turn could
+    fake the boundary - resending a little extra beats sending a broken
+    history.
+    """
+    if not delta.startswith("Assistant:"):
+        return delta
+    i = delta.rfind("\nUser: ")
+    if i < 0 or "\nUser: " in delta[:i]:
+        return delta
+    return delta[i + 1:]
 
 
 def _resolve_cache_key(request: Request, conversation_id: str | None,

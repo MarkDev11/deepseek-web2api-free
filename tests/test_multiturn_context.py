@@ -216,3 +216,42 @@ def test_model_type_is_never_expert_for_shorthand_routes():
     for name in ("deepseek-chat", "deepseek-reasoner"):
         decision, _ = _decision(name)
         assert decision.model_type == "default"
+
+
+def test_continuation_drops_echoed_assistant_reply(monkeypatch):
+    """v3.3.16: the upstream session already holds its own reply, the web
+    client never resends it, so neither do we - the DeepSeek chat shows the
+    bare new message instead of a nested history echo."""
+    _fresh_cache(monkeypatch)
+    account = _Account("account-a")
+    key = "conv:echo-strip"
+
+    first = server.AcquiredAccount(account, cache_key=key)
+    first.prepare_prompt("User: hi syaang")
+    first.create_session()
+    first.record_message_id(2, full_prompt="User: hi syaang")
+
+    second = server.AcquiredAccount(account, cache_key=key)
+    full = ("User: hi syaang\nAssistant: Hi! Ada yang bisa aku bantu?"
+            "\nUser: kamu bisa bantu aku?")
+    assert second.prepare_prompt(full) == "User: kamu bisa bantu aku?"
+    assert second.create_session() == "session-account-a-1"
+    second.record_message_id(4, full_prompt=full)
+
+    # sent_prompt keeps growing against the BUILT prompt, not the stripped
+    # text, so the next turn still matches and strips cleanly.
+    third = server.AcquiredAccount(account, cache_key=key)
+    full3 = full + "\nAssistant: Bisa banget!\nUser: kamu bisa apa aja?"
+    assert third.prepare_prompt(full3) == "User: kamu bisa apa aja?"
+
+
+def test_ambiguous_echo_boundary_keeps_full_delta():
+    """Only strip when the echo/new-message boundary is unambiguous."""
+    # echo quotes a conversation -> two line-start "User: " markers
+    d = "Assistant: kamu bilang:\nUser: hi\nkan?\nUser: lanjut"
+    assert server._strip_echoed_history(d) == d
+    # tool loop tail: no new user message at all
+    d2 = "Assistant: <call/>\nTool result: ok"
+    assert server._strip_echoed_history(d2) == d2
+    # delta that already starts with the new user message
+    assert server._strip_echoed_history("User: halo") == "User: halo"
