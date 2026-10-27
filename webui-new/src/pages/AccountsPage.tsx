@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { LogIn, Plus, RefreshCw, Users } from 'lucide-react'
+import { Copy, LogIn, Plus, RefreshCw, Users } from 'lucide-react'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -38,6 +38,9 @@ export default function AccountsPage() {
   const [viewing, setViewing] = useState<Account | null>(null)
   const [deleting, setDeleting] = useState<Account | null>(null)
   const [browserBusy, setBrowserBusy] = useState(false)
+  const [captureOpen, setCaptureOpen] = useState(false)
+  const [captureHref, setCaptureHref] = useState<string | null>(null)
+  const pasteCmd = "copy(JSON.parse(localStorage.userToken).value + '||' + document.cookie)"
   const autoTimer = useRef<number | null>(null)
   useEffect(() => () => {
     if (autoTimer.current !== null) window.clearInterval(autoTimer.current)
@@ -88,36 +91,46 @@ export default function AccountsPage() {
       // and ds_session_id is HttpOnly). So guide the one-paste flow: open
       // the tab, pre-copy the console command, open Quick import.
       if (e instanceof ApiCallError && e.status === 400) {
-        // Auto-capture: the DeepSeek login window opens first, then this
-        // panel keeps ATTACHING a tiny script to it - assigning
-        // popup.location.href = 'javascript:...' runs the script inside the
-        // popup's own origin (chat.deepseek.com), where userToken and the
-        // visible cookies are readable. The user only logs in; nothing else
-        // to click. The script posts credentials once (with a one-time tag),
-        // the popup closes itself, and /capture-events?tag=... tells the
-        // panel the delivery happened. Zero installs, zero local software.
-        const pasteCmd = "copy(JSON.parse(localStorage.userToken).value + '||' + document.cookie)"
+        // The zero-click auto-attach was not a coding bug: measured in
+        // Chrome (headless test, 2026-10-27) assigning popup.location.href =
+        // 'javascript:...' into ANOTHER site's window throws SecurityError -
+        // the spec forbids cross-origin javascript: navigation, so Chrome
+        // silently never ran it and the popup just sat there. What still
+        // works cross-origin: close(), closed, and the backend poll. So the
+        // panel still TRIES the injection every 2s (Firefox-family may
+        // honour it = full zero-click), but the guaranteed path is the
+        // one-click bookmark this dialog offers: bookmarklets are
+        // user-initiated and DO run inside DeepSeek's page, they POST
+        // token+cookies to /admin/api/capture with a one-time tag and close
+        // their own tab; the panel notices via /capture-events?tag=...,
+        // refreshes the list and closes the login popup (allowed).
         // Popup window (not a tab), OAuth-style: small and focused.
         const w = window.open('https://chat.deepseek.com/', 'dsweb_login', 'width=480,height=760,left=120,top=90')
         try {
           const cap = await get<{ enabled: boolean; secret: string }>('/admin/api/capture-code')
           if (w && cap?.enabled && cap.secret) {
             const tag = Math.random().toString(36).slice(2, 10)
-            const js =
-              'if(window.__dsw||window.__dswe){void 0}else{' +
-              'var t=localStorage.getItem("userToken");if(!t){void 0}else{' +
-              'window.__dsw=1;fetch(' + JSON.stringify(location.origin + '/admin/api/capture') +
-              ',{method:"POST",headers:{"content-type":"text/plain"},' +
-              'body:JSON.stringify({raw:t+"||"+document.cookie,secret:' + JSON.stringify(cap.secret) +
-              ',tag:' + JSON.stringify(tag) + '})})' +
-              '.then(function(r){return r.json()}).then(function(j){' +
-              'if(j.ok){setTimeout(function(){window.close()},600)}' +
-              'else{window.__dswe=1;alert("Ditolak panel: "+(j.detail||"?"))}})' +
-              '.catch(function(e){window.__dswe=1;alert("Gagal kirim ke panel: "+e)})}}void 0'
-            toast({
-              title: 'Auto-capture aktif',
-              description: 'Login saja di jendela DeepSeek itu. Begitu berhasil, token + cookie terkirim sendiri ke panel dan jendela menutup otomatis - tanpa klik apa pun.',
-            })
+            const captureUrl = JSON.stringify(location.origin + '/admin/api/capture')
+            const secretAndTag = JSON.stringify(cap.secret) + ',tag:' + JSON.stringify(tag)
+            // Silent variant for the automatic cross-origin attempts.
+            const autoJs =
+              "(function(){try{if(window.__dswSent)return;var t=localStorage.getItem('userToken');if(!t)return;window.__dswSent=1;fetch(" +
+              captureUrl +
+              ",{method:'POST',headers:{'content-type':'text/plain'},body:JSON.stringify({raw:t+'||'+document.cookie,secret:" +
+              secretAndTag +
+              "})}).then(function(r){return r.json()}).then(function(j){if(j.ok)setTimeout(function(){window.close()},600)}).catch(function(){window.__dswSent=0})}catch(e){void 0}})()"
+            // Loud variant carried by the bookmark (user click = feedback).
+            const clickJs =
+              "(async()=>{try{var t=localStorage.getItem('userToken');" +
+              "if(!t){alert('Login dulu di halaman ini, lalu klik bookmark ini lagi.');return}" +
+              "var r=await fetch(" + captureUrl +
+              ",{method:'POST',headers:{'content-type':'text/plain'},body:JSON.stringify({raw:t+'||'+document.cookie,secret:" +
+              secretAndTag +
+              "})});var j=await r.json();" +
+              "if(j.ok){alert('Terkirim ke panel - '+(j.updated?'akun diperbarui':'akun baru'));window.close()}" +
+              "else{alert('Ditolak panel: '+(j.detail||r.status))}}catch(e){alert('Gagal kirim ke panel: '+e)}})()"
+            setCaptureHref('javascript:' + encodeURIComponent(clickJs))
+            setCaptureOpen(true)
             const stop = () => {
               if (autoTimer.current !== null) window.clearInterval(autoTimer.current)
               autoTimer.current = null
@@ -127,15 +140,17 @@ export default function AccountsPage() {
             autoTimer.current = window.setInterval(async () => {
               ticks += 1
               try {
-                if (!w.closed) w.location.href = 'javascript:' + encodeURIComponent(js)
+                if (!w.closed) w.location.href = 'javascript:' + encodeURIComponent(autoJs)
               } catch {
-                // browser guarded the cross-origin navigation; the backend
-                // poll below is the delivery signal anyway
+                // Chrome refuses this (see note above); the bookmark click
+                // is the guaranteed delivery path there.
               }
               try {
                 const ev = await get<{ seen: boolean }>('/admin/api/capture-events?tag=' + tag)
                 if (ev.seen) {
                   stop()
+                  setCaptureOpen(false)
+                  try { if (!w.closed) w.close() } catch { /* popup already gone */ }
                   toast({ title: 'Akun tertangkap ke panel', description: 'Daftar akun akan termutakhirkan otomatis.' })
                   refresh()
                   return
@@ -143,14 +158,10 @@ export default function AccountsPage() {
               } catch {
                 // transient network blip; keep polling
               }
-              if (ticks >= 30) {
+              if (ticks >= 150) {
+                // 5 min without a delivery: keep the dialog open so the
+                // paste fallback stays reachable, but stop polling.
                 stop()
-                void navigator.clipboard?.writeText(pasteCmd).catch(() => undefined)
-                setAddOpen(true)
-                toast({
-                  title: 'Auto-capture tidak terdeteksi',
-                  description: 'Situs DeepSeek mungkin memblokir script otomatis. Cara lama: paste blob login (sudah tersalin di clipboard) ke Quick import.',
-                })
               }
             }, 2000)
             return
@@ -289,6 +300,61 @@ export default function AccountsPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* One-click capture: install the bookmark once; after login, click it. */}
+      <Dialog open={captureOpen} onOpenChange={setCaptureOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Tangkap akun DeepSeek</DialogTitle>
+            <DialogDescription>
+              Login dulu di jendela DeepSeek yang terbuka tadi. Browser melarang
+              sebuah situs membaca data situs lain secara diam-diam, jadi sekali
+              saja: seret tombol «Curi ke Panel» ke bookmarks bar. Setelah itu,
+              setiap selesai login cukup klik tombol itu di halaman DeepSeek -
+              token terkirim sendiri, tab menutup sendiri, dan daftar akun di
+              sini ikut termutakhirkan.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <a
+                href={captureHref ?? '#'}
+                className="inline-flex items-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 cursor-grab select-none"
+                onClick={(e) => e.preventDefault()}
+              >
+                Curi ke Panel
+              </a>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(captureHref ?? '').catch(() => undefined)
+                  toast({ title: 'Kode disalin', description: 'Buat bookmark baru lalu tempel kode itu sebagai URL-nya.' })
+                }}
+              >
+                <Copy className="mr-1 h-4 w-4" />
+                Salin kode
+              </Button>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="w-full justify-start px-0 text-xs text-muted-foreground"
+              onClick={() => {
+                setCaptureOpen(false)
+                void navigator.clipboard?.writeText(pasteCmd).catch(() => undefined)
+                setAddOpen(true)
+                toast({
+                  title: 'Cara lama siap',
+                  description: 'Perintah console tersalin: jalankan di tab DeepSeek (F12 lalu Console, Ctrl+V + Enter), kemudian tempel hasilnya di kotak Quick import.',
+                })
+              }}
+            >
+              Cara lama: tempel manual
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Detail drawer */}
       <AccountDetailDrawer
