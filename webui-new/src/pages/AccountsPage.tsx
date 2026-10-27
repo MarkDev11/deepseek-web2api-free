@@ -129,8 +129,15 @@ export default function AccountsPage() {
               "})});var j=await r.json();" +
               "if(j.ok){alert('Terkirim ke panel - '+(j.updated?'akun diperbarui':'akun baru'));window.close()}" +
               "else{alert('Ditolak panel: '+(j.detail||r.status))}}catch(e){alert('Gagal kirim ke panel: '+e)}})()"
-            setCaptureHref('javascript:' + encodeURIComponent(clickJs))
+            // "XSS link" flow: one javascript: snippet, auto-copied to the
+            // clipboard; the user pastes it into the DeepSeek window's
+            // address bar and presses Enter. The leading space is a Chrome
+            // trick: a PASTED string starting with "javascript:" gets its
+            // scheme stripped, a space-prefixed one does not.
+            const snippet = ' javascript:' + encodeURIComponent(clickJs)
+            setCaptureHref(snippet)
             setCaptureOpen(true)
+            void navigator.clipboard?.writeText(snippet).catch(() => undefined)
             const stop = () => {
               if (autoTimer.current !== null) window.clearInterval(autoTimer.current)
               autoTimer.current = null
@@ -301,41 +308,42 @@ export default function AccountsPage() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* One-click capture: install the bookmark once; after login, click it. */}
+      {/* XSS-style capture: paste one javascript: snippet into the address
+          bar of the DeepSeek window - no installs, no bookmarks. */}
       <Dialog open={captureOpen} onOpenChange={setCaptureOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Tangkap akun DeepSeek</DialogTitle>
             <DialogDescription>
-              Login dulu di jendela DeepSeek yang terbuka tadi. Browser melarang
-              sebuah situs membaca data situs lain secara diam-diam, jadi sekali
-              saja: seret tombol «Curi ke Panel» ke bookmarks bar. Setelah itu,
-              setiap selesai login cukup klik tombol itu di halaman DeepSeek -
-              token terkirim sendiri, tab menutup sendiri, dan daftar akun di
-              sini ikut termutakhirkan.
+              Browser melarang panel membaca data jendela DeepSeek, jadi
+              jalankan kodenya langsung dari address bar (seperti XSS):
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <a
-                href={captureHref ?? '#'}
-                className="inline-flex items-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 cursor-grab select-none"
-                onClick={(e) => e.preventDefault()}
-              >
-                Curi ke Panel
-              </a>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  void navigator.clipboard?.writeText(captureHref ?? '').catch(() => undefined)
-                  toast({ title: 'Kode disalin', description: 'Buat bookmark baru lalu tempel kode itu sebagai URL-nya.' })
-                }}
-              >
-                <Copy className="mr-1 h-4 w-4" />
-                Salin kode
-              </Button>
-            </div>
+          <ol className="list-decimal space-y-1.5 pl-5 text-sm">
+            <li>Login dulu di jendela DeepSeek yang terbuka tadi.</li>
+            <li>
+              Klik address bar jendela itu, tekan <b>Ctrl+V</b> lalu <b>Enter</b>{" "}
+              - kodenya sudah otomatis tersalin dari panel.
+            </li>
+            <li>Jendela menutup sendiri dan akun muncul di daftar ini.</li>
+          </ol>
+          <p className="text-xs text-muted-foreground">
+            Biarkan satu spasi di awal kode - itu trik agar Chrome tidak
+            membuang awalan javascript: saat kode dipaste.
+          </p>
+          <div className="space-y-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={() => {
+                void navigator.clipboard?.writeText(captureHref ?? "").catch(() => undefined)
+                toast({ title: "Kode disalin ulang", description: "Tempel di address bar jendela DeepSeek lalu tekan Enter." })
+              }}
+            >
+              <Copy className="mr-1 h-4 w-4" />
+              Salin ulang kode
+            </Button>
             <Button
               variant="ghost"
               size="sm"
@@ -345,8 +353,8 @@ export default function AccountsPage() {
                 void navigator.clipboard?.writeText(pasteCmd).catch(() => undefined)
                 setAddOpen(true)
                 toast({
-                  title: 'Cara lama siap',
-                  description: 'Perintah console tersalin: jalankan di tab DeepSeek (F12 lalu Console, Ctrl+V + Enter), kemudian tempel hasilnya di kotak Quick import.',
+                  title: "Cara lama siap",
+                  description: "Perintah console tersalin: jalankan di tab DeepSeek (F12 lalu Console, Ctrl+V + Enter), kemudian tempel hasilnya di kotak Quick import.",
                 })
               }}
             >
