@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Plus, RefreshCw, Users } from 'lucide-react'
+import { LogIn, Plus, RefreshCw, Users } from 'lucide-react'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -22,7 +22,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { useApi } from '@/hooks/useApi'
-import { del, ApiCallError } from '@/lib/api'
+import { del, post, ApiCallError } from '@/lib/api'
 import { toast } from '@/hooks/use-toast'
 import { AccountForm } from '@/components/accounts/AccountForm'
 import { AccountTable } from '@/components/accounts/AccountTable'
@@ -37,6 +37,7 @@ export default function AccountsPage() {
   const [editing, setEditing] = useState<Account | null>(null)
   const [viewing, setViewing] = useState<Account | null>(null)
   const [deleting, setDeleting] = useState<Account | null>(null)
+  const [browserBusy, setBrowserBusy] = useState(false)
 
   const accounts = data?.accounts ?? []
 
@@ -53,6 +54,36 @@ export default function AccountsPage() {
     }
   }
 
+  // OAuth-like capture: the server opens a real browser window on
+  // chat.deepseek.com (same popup flow as the dsh-plugin) and grabs the
+  // token + cookies from the live session. Local server runs only - on
+  // Vercel the endpoint answers 400 with a Quick-import hint.
+  const handleBrowserLogin = async () => {
+    setBrowserBusy(true)
+    toast({
+      title: 'Browser login',
+      description: 'A browser window on chat.deepseek.com just opened (or will shortly) - sign in there and the credentials are captured automatically. Keep this page open.',
+    })
+    try {
+      const res = await post<{ ok: boolean; account: Account }>(
+        '/admin/api/accounts/browser-login',
+        {},
+        { signal: AbortSignal.timeout(310_000) },
+      )
+      toast({
+        title: 'Account added',
+        description: res.account.email || res.account.id,
+        variant: 'success',
+      })
+      refresh()
+    } catch (e) {
+      const msg = e instanceof ApiCallError ? e.message : String(e)
+      toast({ title: 'Browser login failed', description: msg, variant: 'destructive' })
+    } finally {
+      setBrowserBusy(false)
+    }
+  }
+
   return (
     <div className="space-y-6 animate-fade-in">
       <PageHeader
@@ -63,6 +94,15 @@ export default function AccountsPage() {
             <Button variant="outline" onClick={refresh} disabled={loading}>
               <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
               Refresh
+            </Button>
+            <Button
+              variant="outline"
+              onClick={handleBrowserLogin}
+              disabled={browserBusy}
+              title="Opens chat.deepseek.com in a browser window and captures token + cookies automatically - same flow as the DSH plugin. Local server runs only."
+            >
+              {browserBusy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+              {browserBusy ? 'Waiting for login…' : 'Browser login'}
             </Button>
             <Button onClick={() => setAddOpen(true)}>
               <Plus className="h-4 w-4" />
@@ -89,7 +129,7 @@ export default function AccountsPage() {
               <Users className="mx-auto h-10 w-10 text-muted-foreground/40" />
               <h3 className="mt-3 text-sm font-medium">No accounts</h3>
               <p className="mt-1 text-xs text-muted-foreground">
-                Click "Add account" in the top-right corner, or write accounts to data/accounts.json.
+                Click "Browser login" to sign in once (the token is captured automatically), "Add account" to paste credentials, or write accounts to data/accounts.json.
               </p>
             </div>
           ) : (

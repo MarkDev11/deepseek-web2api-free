@@ -76,6 +76,7 @@
 - 模型路由是 `cordis.patch.yml` 里 `llm-pi-ai` 的 `web2api` provider（`api: openai-completions`，`baseURL: https://deepseek-web2api-free-chi.vercel.app/v1`，`apiKeyEnv: DSWEB_API_KEY`，模型 `deepseek-chat`，128K 上下文），插件入口用 `- insert:` 行挂载（dsh 的 patch 语义：纯 `- id/name` 行只匹配既有条目，会警告 "entry not found"）。
 - 验证链：`dsh headless "Reply with exactly: OK" --patch <overlay>`（独立 DSH_HOME）经本地代理路线真实回出 "OK"；桌面端 HMR 对 patch 文件即时生效（凭证文件随后出现 `DSWEB_API_KEY`）。
 - 已知限制：admin token 只活在代理进程内存里，Vercel 冷启动后旧 token 立即失效——插件靠周期重登自愈，最长窗口 = refreshMinutes；`/v1/*` 在 401 时的报错属于预期，不是账号池问题。本地后端（`local.workdir` 指向仓库）凭证当前是死账号，需先在 WebUI 换新凭证。
+- **WebUI「Browser login」按钮（v3.3.14，2026-10-27）**：账号池页头部新增「Browser login」按钮（`webui-new/src/pages/AccountsPage.tsx`），调 `POST /admin/api/accounts/browser-login`（`admin.capture_login_credentials()`）。服务端跑与插件完全相同的抓取脚本 `dsh-plugin/scripts/login.mjs`（Playwright 弹真实浏览器窗口 → 用户在 chat.deepseek.com 登录 → 从 localStorage/cookie 抓 token+cookies → 写 `~/.dsh/dsweb-accounts.json`），然后导入 `pool.add()`——handle 与 dsh-plugin 的账号抓取路径一致。仅本地 `python server.py` 可用：Vercel 无头无 node，端点立刻回 400 并提示改用「Quick import」；测试 `tests/test_stop_protocol.py::TestBrowserLoginCapture`。
 
 **结论（也写给用户看）**：cookie 会自动跟着活会话更新、死 token 会立刻被摘出轮转并在面板写明「去浏览器复制新 token」，但 token 本身仍然只能由人在浏览器登录时签发。
 
