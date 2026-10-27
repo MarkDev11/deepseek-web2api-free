@@ -221,6 +221,7 @@ export async function launchOAuthPopupCapture(options) {
   const profileDir = path.join(os.homedir(), '.dsh', 'dsweb-browser-profile');
   fs.mkdirSync(profileDir, { recursive: true });
   const args = [
+    ...(Array.isArray(opts.extraArgs) ? opts.extraArgs : []),
     '--remote-debugging-port=' + port,
     '--user-data-dir=' + profileDir,
     '--no-first-run',
