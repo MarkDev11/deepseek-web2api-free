@@ -78,6 +78,23 @@ export default function AccountsPage() {
       refresh()
     } catch (e) {
       const msg = e instanceof ApiCallError ? e.message : String(e)
+      // Hosted (Vercel) has no browser on the server. A popup tab IS still
+      // possible here - it just cannot be read automatically (same-origin:
+      // chat.deepseek.com localStorage/cookies are invisible to this app,
+      // and ds_session_id is HttpOnly). So guide the one-paste flow: open
+      // the tab, pre-copy the console command, open Quick import.
+      if (e instanceof ApiCallError && e.status === 400) {
+        window.open('https://chat.deepseek.com/', '_blank', 'noopener')
+        void navigator.clipboard
+          ?.writeText("copy(JSON.parse(localStorage.userToken).value + '||' + document.cookie)")
+          .catch(() => undefined)
+        setAddOpen(true)
+        toast({
+          title: 'Opened chat.deepseek.com',
+          description: 'Log in there, run the copied console command (DevTools > Console, Ctrl+V + Enter), then paste the blob into the Quick import box - the console command is already on your clipboard.',
+        })
+        return
+      }
       toast({ title: 'Browser login failed', description: msg, variant: 'destructive' })
     } finally {
       setBrowserBusy(false)
