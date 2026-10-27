@@ -84,7 +84,30 @@ export default function AccountsPage() {
       // and ds_session_id is HttpOnly). So guide the one-paste flow: open
       // the tab, pre-copy the console command, open Quick import.
       if (e instanceof ApiCallError && e.status === 400) {
-        // Popup window (not a tab), OAuth-style: small and focused.
+        // Zero-paste path: the silent local helper (hidden wscript task, autostarts
+        // at logon, no window) opens the OAuth popup HERE and captures token+cookies
+        // via CDP, then we add the account to the hosted pool ourselves.
+        try {
+          const res = await fetch('http://127.0.0.1:55343/login', { method: 'POST', signal: AbortSignal.timeout(610_000) })
+          if (res.status === 409) {
+            toast({ title: 'Login already in progress', description: 'A small DeepSeek window is already open - finish the login there.' })
+            return
+          }
+          const cap = (await res.json()) as { ok?: boolean; account?: { token?: string; cookies?: string; email?: string; id?: string } }
+          if (cap?.ok && cap.account?.token) {
+            await post<{ account: Account }>('/admin/api/accounts', {
+              raw: cap.account.token + '||' + (cap.account.cookies || ''),
+              email: cap.account.email || undefined,
+            })
+            toast({ title: 'Account added', description: cap.account.email || cap.account.id || 'Captured from the login window', variant: 'success' })
+            refresh()
+            return
+          }
+          console.warn('dsweb login helper capture failed:', cap)
+        } catch (he) {
+          console.warn('dsweb login helper unavailable:', he)
+        }
+        // Fallback (no helper on this machine): small OAuth-style popup window + one paste.
         window.open(
           'https://chat.deepseek.com/',
           'dsweb_login',
