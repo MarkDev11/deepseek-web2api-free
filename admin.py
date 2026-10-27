@@ -240,7 +240,7 @@ _stats = StatsSnapshot()
 _pool = AccountPool()
 
 # Kept in sync with server.app.version by tests/test_admin_env.py.
-SERVER_VERSION = "3.3.18"
+SERVER_VERSION = "3.3.19"
 
 
 def get_pool() -> AccountPool:
@@ -352,7 +352,9 @@ async def logout(request: Request):
 @router.get("/api-keys")
 async def list_api_keys(request: Request):
     _check_auth(request)
-    return {"keys": get_api_key_store().list_keys()}
+    store = get_api_key_store()
+    store.sync_from_kv()
+    return {"keys": store.list_keys()}
 
 
 @router.post("/api-keys")

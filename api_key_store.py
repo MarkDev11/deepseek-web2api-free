@@ -311,6 +311,22 @@ class ApiKeyStore:
         except Exception as exc:
             log.warning("api_keys_kv_write_failed", extra={"error": str(exc)})
 
+    def sync_from_kv(self) -> None:
+        """One-shot authoritative pull so an admin action sees - and pushes
+        back - the latest cross-instance state. No-op without KV; on failure
+        the local mirror stays untouched. Without this, a create through an
+        instance with a stale mirror would push a snapshot that silently
+        drops keys another instance just added (last-write-wins clobber),
+        and a reveal could answer 404 for a key created seconds ago."""
+        if _kv_config() is None:
+            return
+        try:
+            records = self._kv_pull()
+            if records is not None and records != self._snapshot():
+                self._replace_all(records)
+        except Exception as exc:
+            log.warning("api_keys_kv_sync_failed", extra={"error": str(exc)})
+
     def _kv_sync_on_init(self) -> None:
         if _kv_config() is None:
             return
@@ -340,11 +356,7 @@ class ApiKeyStore:
 
     def _kv_refresh_tick(self) -> None:
         try:
-            records = self._kv_pull()
-            if records is not None and records != self._snapshot():
-                self._replace_all(records)
-        except Exception as exc:
-            log.warning("api_keys_kv_refresh_failed", extra={"error": str(exc)})
+            self.sync_from_kv()
         finally:
             try:
                 self._schedule_kv_refresh()
@@ -400,6 +412,7 @@ class ApiKeyStore:
         if len(normalized_name) > 64:
             raise ValueError("Key name must be 64 characters or fewer")
 
+        self.sync_from_kv()
         key = f"sk-{secrets.token_urlsafe(32)}"
         created_at = int(time.time())
         conn = self._connect()
@@ -431,19 +444,29 @@ class ApiKeyStore:
         finally:
             conn.close()
 
-    def reveal_key(self, key_id: str) -> str | None:
-        """Full key for the WebUI copy button. None when the row predates
-        key-material storage or decryption fails (rotated encryption key)."""
+    def _lookup_material(self, key_id: str):
         conn = self._connect()
         try:
-            row = conn.execute(
+            return conn.execute(
                 "SELECT key_material FROM api_keys WHERE id = ?", (key_id,)
             ).fetchone()
-            return self._reveal_material(row["key_material"]) if row else None
         finally:
             conn.close()
 
+    def reveal_key(self, key_id: str) -> str | None:
+        """Full key for the WebUI copy button. None when no row holds the
+        key (revoked, or created on another instance and still not in KV),
+        when the row predates key-material storage, or when decryption fails
+        (rotated encryption key). A miss triggers one fresh KV pull first so
+        the copy button does not depend on which instance serves it."""
+        row = self._lookup_material(key_id)
+        if row is None and _kv_config() is not None:
+            self.sync_from_kv()
+            row = self._lookup_material(key_id)
+        return self._reveal_material(row["key_material"]) if row else None
+
     def revoke_key(self, key_id: str) -> bool:
+        self.sync_from_kv()
         conn = self._connect()
         try:
             cursor = conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))

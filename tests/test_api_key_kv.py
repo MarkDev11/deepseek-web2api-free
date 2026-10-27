@@ -148,3 +148,28 @@ def test_reveal_material_survives_kv_round_trip(tmp_path, kv):
     record = next(r for r in instance_b.list_keys() if r["name"] == "shared")
     assert record["revealable"] is True
     assert instance_b.reveal_key(record["id"]) == created["key"]
+
+def test_reveal_self_heals_across_instances(tmp_path, kv):
+    kv()
+    instance_a = ApiKeyStore(tmp_path / "a.sqlite3")
+    instance_b = ApiKeyStore(tmp_path / "b.sqlite3")  # booted earlier, stale
+
+    created = instance_a.create_key("late-arrival")
+    record = next(r for r in instance_a.list_keys() if r["name"] == "late-arrival")
+
+    # No manual tick: the reveal itself pulls once and finds the key.
+    assert instance_b.reveal_key(record["id"]) == created["key"]
+
+
+def test_create_on_stale_instance_does_not_clobber(tmp_path, kv):
+    kv()
+    instance_a = ApiKeyStore(tmp_path / "a.sqlite3")
+    instance_b = ApiKeyStore(tmp_path / "b.sqlite3")
+
+    key_a = instance_a.create_key("made-on-a")
+    # b's mirror still predates key A; creating through b must not erase it.
+    key_b = instance_b.create_key("made-on-b")
+
+    fresh = ApiKeyStore(tmp_path / "fresh.sqlite3")
+    assert fresh.verify(key_a["key"]) is True
+    assert fresh.verify(key_b["key"]) is True
