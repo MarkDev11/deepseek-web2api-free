@@ -13,6 +13,7 @@ from collections import deque
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
+import api_key_store
 import credential_store
 import account_pool as account_pool
 from credentials import merge_cookie_blobs, parse_credential_blob
@@ -239,7 +240,7 @@ _stats = StatsSnapshot()
 _pool = AccountPool()
 
 # Kept in sync with server.app.version by tests/test_admin_env.py.
-SERVER_VERSION = "3.3.16"
+SERVER_VERSION = "3.3.17"
 
 
 def get_pool() -> AccountPool:
@@ -501,6 +502,7 @@ async def env_info(request: Request):
             {"name": "DEEPSEEK_CREDENTIAL_CHECK_PATH", "value": _env("DEEPSEEK_CREDENTIAL_CHECK_PATH") or "/api/v0/users/settings", "is_default": _flag("DEEPSEEK_CREDENTIAL_CHECK_PATH") == "default"},
         ],
         "credential_store": credential_store.describe(),
+        "kv_api_keys": api_key_store.kv_status(),
         "client_fingerprint": _client_fingerprint(),
     }
 

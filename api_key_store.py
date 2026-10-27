@@ -6,6 +6,7 @@ to the caller and is never recoverable from the database.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -14,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 
+import credential_store
 from logger import get_logger
 
 log = get_logger("api_key_store")
@@ -67,13 +69,48 @@ def _ensure_writable(path: Path) -> Path:
             "path": str(path), "fallback": str(fallback), "error": str(exc)})
         return fallback
 
+# ── KV persistence (serverless-safe, v3.3.17) ────────────────────────
+# The sqlite file lives in /tmp on Vercel, so it only ever survived as long
+# as its instance: after every cold start or deploy every WebUI-issued key
+# was gone and clients holding that key got intermittent 401s (requests
+# landing on a fresh instance failed while a warm one still had the row).
+# When the same Upstash REST pair that backs the account store is present,
+# KV is authoritative: pull at instance start, push after every mutation,
+# and re-pull every API_KEY_KV_SYNC_SECS (default 60, 0 disables the timer)
+# so a key created or revoked on another instance becomes visible without
+# a restart. sqlite stays as the local mirror that answers every verify().
+# The KV key name is KV_API_KEYS_KEY.
+
+_KV_PAYLOAD_VERSION = 1
+
+
+def _kv_config():
+    return credential_store._kv_config()
+
+
+def _kv_command(cfg, args):
+    return credential_store._command(cfg, args)
+
+
+def _kv_key() -> str:
+    return (os.environ.get("KV_API_KEYS_KEY", "").strip() or "ds2api:api_keys.json")
+
+
+def kv_status() -> dict:
+    """Shape for /admin/api/env: is the KV backend active and under which key."""
+    cfg = _kv_config()
+    return {"enabled": cfg is not None, "key": _kv_key() if cfg else None}
+
+
 class ApiKeyStore:
-    """SQLite-backed API key metadata and hash store."""
+    """SQLite-backed API key metadata and hash store (optional KV mirror)."""
 
     def __init__(self, path: Path, legacy_keys: list[str] | None = None):
         self.path = Path(path)
         self._legacy_keys = legacy_keys or []
+        self._kv_timer: threading.Timer | None = None
         self._initialize()
+        self._schedule_kv_refresh()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=15)
@@ -159,6 +196,120 @@ class ApiKeyStore:
             except OSError:
                 pass
 
+        self._kv_sync_on_init()
+
+    # ── KV mirror helpers ─────────────────────────────────────────────
+
+    def _snapshot(self) -> list[dict]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, name, key_hash, key_prefix, created_at FROM api_keys"
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def _replace_all(self, records: list[dict]) -> int:
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM api_keys")
+            for rec in records:
+                conn.execute(
+                    """INSERT OR REPLACE INTO api_keys
+                       (id, name, key_hash, key_prefix, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (rec["id"], rec["name"], rec["key_hash"],
+                     rec.get("key_prefix") or rec["key_hash"][:16], int(rec.get("created_at") or 0)),
+                )
+            conn.commit()
+            return len(records)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _kv_pull(self) -> list[dict] | None:
+        """Records held in KV, or None when KV holds nothing usable
+        (not configured, key absent, network error, malformed payload)."""
+        cfg = _kv_config()
+        if cfg is None:
+            return None
+        try:
+            raw = _kv_command(cfg, ["get", _kv_key()])
+        except Exception as exc:
+            log.warning("api_keys_kv_read_failed", extra={"error": str(exc)})
+            return None
+        if raw is None:
+            return None
+        payload = credential_store._decode(str(raw))
+        if not payload:
+            return None
+        try:
+            obj = json.loads(payload)
+            records = obj.get("keys") if isinstance(obj, dict) else None
+        except ValueError:
+            log.warning("api_keys_kv_bad_payload")
+            return None
+        if not isinstance(records, list):
+            return None
+        return [r for r in records
+                if isinstance(r, dict) and r.get("id") and r.get("key_hash")]
+
+    def _kv_push(self) -> None:
+        """Write the local snapshot to KV; a failure is logged, not fatal
+        (this instance keeps working from sqlite, durability across
+        instances is what degrades)."""
+        cfg = _kv_config()
+        if cfg is None:
+            return
+        payload = json.dumps({"v": _KV_PAYLOAD_VERSION, "keys": self._snapshot()})
+        try:
+            _kv_command(cfg, ["set", _kv_key(), credential_store._encode(payload)])
+        except Exception as exc:
+            log.warning("api_keys_kv_write_failed", extra={"error": str(exc)})
+
+    def _kv_sync_on_init(self) -> None:
+        if _kv_config() is None:
+            return
+        records = self._kv_pull()
+        if records is None:
+            # KV holds nothing yet: seed it with the local content
+            # (e.g. the one-time legacy env import) instead of wiping it.
+            self._kv_push()
+            log.info("api_keys_kv_seeded")
+            return
+        count = self._replace_all(records)
+        log.info("api_keys_kv_hydrated", extra={"count": count})
+
+    def _kv_refresh_secs(self) -> int:
+        try:
+            return int(os.environ.get("API_KEY_KV_SYNC_SECS") or 60)
+        except ValueError:
+            return 60
+
+    def _schedule_kv_refresh(self) -> None:
+        if _kv_config() is None or self._kv_refresh_secs() <= 0:
+            return
+        timer = threading.Timer(self._kv_refresh_secs(), self._kv_refresh_tick)
+        timer.daemon = True
+        timer.start()
+        self._kv_timer = timer
+
+    def _kv_refresh_tick(self) -> None:
+        try:
+            records = self._kv_pull()
+            if records is not None and records != self._snapshot():
+                self._replace_all(records)
+        except Exception as exc:
+            log.warning("api_keys_kv_refresh_failed", extra={"error": str(exc)})
+        finally:
+            try:
+                self._schedule_kv_refresh()
+            except Exception:
+                pass
+
     @staticmethod
     def _public_record(row: sqlite3.Row) -> dict:
         return {
@@ -228,7 +379,9 @@ class ApiKeyStore:
                 "SELECT id, name, key_prefix, created_at FROM api_keys WHERE key_hash = ?",
                 (self._key_hash(key),),
             ).fetchone()
-            return {"key": key, "api_key": self._public_record(row)}
+            result = {"key": key, "api_key": self._public_record(row)}
+            self._kv_push()
+            return result
         except Exception:
             conn.rollback()
             raise
@@ -240,7 +393,10 @@ class ApiKeyStore:
         try:
             cursor = conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
             conn.commit()
-            return cursor.rowcount > 0
+            removed = cursor.rowcount > 0
+            if removed:
+                self._kv_push()
+            return removed
         except Exception:
             conn.rollback()
             raise
