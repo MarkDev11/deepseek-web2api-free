@@ -77,7 +77,7 @@
 - 验证链：`dsh headless "Reply with exactly: OK" --patch <overlay>`（独立 DSH_HOME）经本地代理路线真实回出 "OK"；桌面端 HMR 对 patch 文件即时生效（凭证文件随后出现 `DSWEB_API_KEY`）。
 - 已知限制：admin token 只活在代理进程内存里，Vercel 冷启动后旧 token 立即失效——插件靠周期重登自愈，最长窗口 = refreshMinutes；`/v1/*` 在 401 时的报错属于预期，不是账号池问题。本地后端（`local.workdir` 指向仓库）凭证当前是死账号，需先在 WebUI 换新凭证。
 - **WebUI「Browser login」按钮（v3.3.14，2026-10-27）**：账号池页头部新增「Browser login」按钮（`webui-new/src/pages/AccountsPage.tsx`），调 `POST /admin/api/accounts/browser-login`（`admin.capture_login_credentials()`）。服务端跑与插件完全相同的抓取脚本 `dsh-plugin/scripts/login.mjs`（Playwright 弹真实浏览器窗口 → 用户在 chat.deepseek.com 登录 → 从 localStorage/cookie 抓 token+cookies → 写 `~/.dsh/dsweb-accounts.json`），然后导入 `pool.add()`——handle 与 dsh-plugin 的账号抓取路径一致。仅本地 `python server.py` 可用：Vercel 无头无 node，端点立刻回 400 并提示改用「Quick import」；测试 `tests/test_stop_protocol.py::TestBrowserLoginCapture`。
-  - **Update 2026-10-27（同日）**: 用户要「无感 capture」，故助手以**隐形形态**回归：`dsh-plugin/scripts/run-login-helper-hidden.vbs`（wscript window=0，无控制台）复制到启动文件夹即随登录自启，监听 `127.0.0.1:55343`。WebUI Browser login 在端点回 400 后先调 `POST /login`（610s；409=已有登录窗）→ 小窗 OAuth 抓取成功即 `POST /admin/api/accounts`（raw）自动入池，**零粘贴**；助手不在运行才退回小弹窗（`window.open` 480x760）+ 一次粘贴的引导流程（纯网页受 same-origin/HttpOnly 限制，这是托管侧的地板）。
+  - **Update 2026-10-27（同日）**: the panel must stay fully independent of the local device, so the local helper variant was removed. Browser login on hosted now opens a small OAuth-style popup window (`window.open` 480x760) and guides the one-paste Quick import; automatic capture remains server-side only for local `python server.py`.
 
 **结论（也写给用户看）**：cookie 会自动跟着活会话更新、死 token 会立刻被摘出轮转并在面板写明「去浏览器复制新 token」，但 token 本身仍然只能由人在浏览器登录时签发。
 
