@@ -129,15 +129,15 @@ export default function AccountsPage() {
               "})});var j=await r.json();" +
               "if(j.ok){alert('Terkirim ke panel - '+(j.updated?'akun diperbarui':'akun baru'));window.close()}" +
               "else{alert('Ditolak panel: '+(j.detail||r.status))}}catch(e){alert('Gagal kirim ke panel: '+e)}})()"
-            // "XSS link" flow: one javascript: snippet, auto-copied to the
-            // clipboard; the user pastes it into the DeepSeek window's
-            // address bar and presses Enter. The leading space is a Chrome
-            // trick: a PASTED string starting with "javascript:" gets its
-            // scheme stripped, a space-prefixed one does not.
-            const snippet = ' javascript:' + encodeURIComponent(clickJs)
-            setCaptureHref(snippet)
+            // Console flow: the clipboard carries the RAW js (no
+            // javascript: prefix, no percent-encoding). The address-bar
+            // variant proved unreliable in the field: Chrome strips a
+            // pasted "javascript:" scheme and the snippet became a Bing
+            // search query (user screenshot 2026-10-27). The DevTools
+            // Console runs exactly this text with zero scheme games.
+            setCaptureHref(clickJs)
             setCaptureOpen(true)
-            void navigator.clipboard?.writeText(snippet).catch(() => undefined)
+            void navigator.clipboard?.writeText(clickJs).catch(() => undefined)
             const stop = () => {
               if (autoTimer.current !== null) window.clearInterval(autoTimer.current)
               autoTimer.current = null
@@ -308,28 +308,35 @@ export default function AccountsPage() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* XSS-style capture: paste one javascript: snippet into the address
-          bar of the DeepSeek window - no installs, no bookmarks. */}
+      {/* One-paste capture: the raw JS is auto-copied; run it in the
+          DeepSeek window's DevTools Console - no installs, no bookmarks,
+          and unlike the address bar it cannot turn into a search. */}
       <Dialog open={captureOpen} onOpenChange={setCaptureOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Tangkap akun DeepSeek</DialogTitle>
             <DialogDescription>
               Browser melarang panel membaca data jendela DeepSeek, jadi
-              jalankan kodenya langsung dari address bar (seperti XSS):
+              jalankan kodenya langsung di halaman itu lewat Console:
             </DialogDescription>
           </DialogHeader>
           <ol className="list-decimal space-y-1.5 pl-5 text-sm">
             <li>Login dulu di jendela DeepSeek yang terbuka tadi.</li>
             <li>
-              Klik address bar jendela itu, tekan <b>Ctrl+V</b> lalu <b>Enter</b>{" "}
-              - kodenya sudah otomatis tersalin dari panel.
+              Di jendela itu tekan <b>F12</b>, buka tab <b>Console</b>. Kalau
+              Chrome meminta izin, ketik <b>allow pasting</b> lalu Enter
+              (hanya sekali per sesi).
+            </li>
+            <li>
+              Tekan <b>Ctrl+V</b> lalu <b>Enter</b> - kodenya sudah otomatis
+              tersalin dari panel saat jendela terbuka.
             </li>
             <li>Jendela menutup sendiri dan akun muncul di daftar ini.</li>
           </ol>
           <p className="text-xs text-muted-foreground">
-            Biarkan satu spasi di awal kode - itu trik agar Chrome tidak
-            membuang awalan javascript: saat kode dipaste.
+            Paste di Console, jangan di address bar - Chrome membuang awalan
+            javascript: saat paste di sana, jadi kodenya malah dianggap
+            kata kunci pencarian (Bing).
           </p>
           <div className="space-y-2">
             <Button
@@ -338,7 +345,7 @@ export default function AccountsPage() {
               className="w-full"
               onClick={() => {
                 void navigator.clipboard?.writeText(captureHref ?? "").catch(() => undefined)
-                toast({ title: "Kode disalin ulang", description: "Tempel di address bar jendela DeepSeek lalu tekan Enter." })
+                toast({ title: "Kode disalin ulang", description: "Tempel di Console jendela DeepSeek (F12) lalu tekan Enter." })
               }}
             >
               <Copy className="mr-1 h-4 w-4" />
