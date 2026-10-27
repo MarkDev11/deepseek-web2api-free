@@ -46,6 +46,7 @@ from tool_dsml import (
     build_dsml_tool_prompt,
 )
 from tool_sieve import StreamSieve, SieveEvent
+from stop_protocol import (STOP_PROTOCOL_TEXT, REMINDER_TEXT, DONE_RE, has_done, strip_done, scrub_stream, auto_continue_max)
 from anthropic_format import (
     AnthropicRequest,
     build_anthropic_prompt,
@@ -210,7 +211,7 @@ def _check_rate_limit(request: Request) -> dict:
     return headers
 
 
-app = FastAPI(title="DeepSeek Chat API", version="3.3.13")
+app = FastAPI(title="DeepSeek Chat API", version="3.3.14")
 
 # ── CORS ─────────────────────────────────────────────────────────────
 # Empty ALLOWED_ORIGINS ⇒ same-origin only. We deliberately do NOT set
@@ -682,6 +683,8 @@ def _build_prompt(messages: list[ChatMessage], tools: list[ToolDef] | None = Non
     tool_prompt_text = None
     if tools:
         tool_prompt_text = build_dsml_tool_prompt([t.model_dump() for t in tools], tool_choice)
+        if tool_prompt_text:
+            tool_prompt_text += "\n\n" + STOP_PROTOCOL_TEXT
 
     has_system_message = any(m.role == "system" for m in messages)
     tool_injected = False
@@ -911,6 +914,32 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
             acq.record_message_id(ready_out["response_message_id"],
                                   ready_out.get("session_id"),
                                   full_prompt=prompt)
+        tnames = list(tool_names or [])
+        if tnames:
+            parent_cur = ready_out.get("response_message_id")
+            guard = 0
+            limit = auto_continue_max()
+            while guard < limit:
+                probe, _ = _parse_response_for_tools(content, tnames)
+                if probe or has_done(content or ""):
+                    break
+                guard += 1
+                ready_n: dict = {}
+                try:
+                    new_content, new_thinking = acq.adapter.chat(
+                        ds_id, REMINDER_TEXT, model_type=model_type,
+                        thinking_enabled=False, search_enabled=False,
+                        parent_message_id=parent_cur, ready_out=ready_n)
+                except (UpstreamEmptyError, UpstreamHintError):
+                    continue
+                if ready_n.get("response_message_id") is not None:
+                    parent_cur = ready_n["response_message_id"]
+                    acq.record_message_id(parent_cur, ready_n.get("session_id"),
+                                          full_prompt=prompt)
+                if not new_content:
+                    continue
+                content = (content or "") + (new_content or "")
+                thinking = (thinking or "") + (new_thinking or "")
         completion_tokens = count_text(content) + count_text(thinking)
         get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
                            prompt_tokens=prompt_tokens,
@@ -965,7 +994,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
     tool_calls, cleaned = parse_dsml_tool_calls(content, tool_names)
     return build_nonstream_response(
         msg_id, MODEL_NAME,
-        content_text=cleaned or content,
+        content_text=strip_done(cleaned or content),
         tool_calls=tool_calls,
         thinking_text=thinking,
         input_tokens=prompt_tokens,
@@ -1056,6 +1085,32 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             acq.record_message_id(ready_out["response_message_id"],
                                   ready_out.get("session_id"),
                                   full_prompt=prompt)
+        tnames = _get_tool_names(tools)
+        if tnames:
+            parent_cur = ready_out.get("response_message_id")
+            guard = 0
+            limit = auto_continue_max()
+            while guard < limit:
+                probe, _ = _parse_response_for_tools(content, tnames)
+                if probe or has_done(content or ""):
+                    break
+                guard += 1
+                ready_n: dict = {}
+                try:
+                    new_content, new_thinking = acq.adapter.chat(
+                        ds_id, REMINDER_TEXT, model_type=model_type,
+                        thinking_enabled=False, search_enabled=False,
+                        parent_message_id=parent_cur, ready_out=ready_n)
+                except (UpstreamEmptyError, UpstreamHintError):
+                    continue
+                if ready_n.get("response_message_id") is not None:
+                    parent_cur = ready_n["response_message_id"]
+                    acq.record_message_id(parent_cur, ready_n.get("session_id"),
+                                          full_prompt=prompt)
+                if not new_content:
+                    continue
+                content = (content or "") + (new_content or "")
+                thinking = (thinking or "") + (new_thinking or "")
         completion_tokens = count_text(content) + count_text(thinking)
         get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
                            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
@@ -1137,7 +1192,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
     # silently lost the chain while `stream=true` emitted it.
     message: dict = {
         "role": "assistant",
-        "content": cleaned or content,
+        "content": strip_done(cleaned or content),
     }
     if thinking:
         message["reasoning_content"] = thinking
@@ -1193,96 +1248,145 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
             def _parse_fn(text):
                 return parse_dsml_tool_calls(text, tool_names)
 
-            sieve = StreamSieve(parse_fn=_parse_fn)
-            full_buf = ""
+            rnd = 0
+            limit = auto_continue_max() if tool_names else 0
+            parent_cur = acq.parent_message_id
+            pending_scrub = ""
+            prompt_cur = eff
+            ro: dict = ready_out
 
             def _record_turn():
                 # Persist the upstream response message id (and the session
                 # actually used, e.g. after an internal retry swap) so the
                 # next turn's parent_message_id is valid.
-                if ready_out.get("response_message_id") is not None:
-                    acq.record_message_id(ready_out["response_message_id"],
-                                          ready_out.get("session_id"),
+                if ro.get("response_message_id") is not None:
+                    acq.record_message_id(ro["response_message_id"],
+                                          ro.get("session_id"),
                                           full_prompt=prompt)
 
-            for token in acq.adapter.chat_stream(ds_id, eff,
-                                                  model_type=model_type,
-                                                  thinking_enabled=thinking_mode,
-                                                  search_enabled=search_enabled,
-                                                  parent_message_id=acq.parent_message_id,
-                                                  ready_out=ready_out):
-                if isinstance(token, dict):
-                    tt = token.get("__type")
-                    if tt == "status":
-                        if token["status"] == "FINISHED":
-                            break
-                        continue
-                    elif tt == "thinking":
-                        content = token.get("content", "")
-                        if content:
-                            completion_parts.append(content)
-                            if not role_sent:
-                                yield _openai_chunk(proxy_id, reasoning_content="", role="assistant")
-                                role_sent = True
-                            yield _openai_chunk(proxy_id, reasoning_content=content)
-                        continue
+            while True:
+                rnd += 1
+                if rnd > 1:
+                    # Stop-protocol follow-up: plain reminder on the same
+                    # session, thinking off (mirrors the plugin's nudge).
+                    ro = {}
+                    prompt_cur = REMINDER_TEXT
+                    th = False
+                    se = False
+                else:
+                    th = thinking_mode
+                    se = search_enabled
+                sieve = StreamSieve(parse_fn=_parse_fn)
+                full_buf = ""
 
-                # Normal text token (str) — feed to sieve
-                full_buf += token
-                for evt in sieve.feed(token):
-                    if evt.type == "text":
-                        if evt.data:
-                            completion_parts.append(evt.data)
+                for token in acq.adapter.chat_stream(ds_id, prompt_cur,
+                                                      model_type=model_type,
+                                                      thinking_enabled=th,
+                                                      search_enabled=se,
+                                                      parent_message_id=parent_cur,
+                                                      ready_out=ro):
+                    if isinstance(token, dict):
+                        tt = token.get("__type")
+                        if tt == "status":
+                            if token["status"] == "FINISHED":
+                                break
+                            continue
+                        elif tt == "thinking":
+                            content = token.get("content", "")
+                            if content:
+                                completion_parts.append(content)
+                                if not role_sent:
+                                    yield _openai_chunk(proxy_id, reasoning_content="", role="assistant")
+                                    role_sent = True
+                                yield _openai_chunk(proxy_id, reasoning_content=content)
+                            continue
+
+                    # Normal text token (str) - feed to sieve
+                    full_buf += token
+                    for evt in sieve.feed(token):
+                        if evt.type == "text":
+                            if evt.data:
+                                emit_txt, pending_scrub = scrub_stream(evt.data, pending_scrub)
+                                if emit_txt:
+                                    completion_parts.append(emit_txt)
+                                    if not role_sent:
+                                        if thinking_mode:
+                                            yield _openai_chunk(proxy_id, reasoning_content="")
+                                        yield _openai_chunk(proxy_id, content=emit_txt, role="assistant")
+                                        role_sent = True
+                                    else:
+                                        yield _openai_chunk(proxy_id, content=emit_txt)
+                        elif evt.type == "tool_calls":
+                            if pending_scrub:
+                                residue = strip_done(pending_scrub)
+                                pending_scrub = ""
+                                if residue:
+                                    yield _openai_chunk(proxy_id, content=residue)
+                            for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
+                                yield chunk
+                            _record_turn()
+                            yield "data: [DONE]\n\n"
+                            return
+
+                # Flush sieve
+                had_tool = False
+                for evt in sieve.flush():
+                    if evt.type == "text" and evt.data:
+                        emit_txt, pending_scrub = scrub_stream(evt.data, pending_scrub)
+                        if emit_txt:
+                            completion_parts.append(emit_txt)
                             if not role_sent:
                                 if thinking_mode:
                                     yield _openai_chunk(proxy_id, reasoning_content="")
-                                yield _openai_chunk(proxy_id, content=evt.data, role="assistant")
+                                yield _openai_chunk(proxy_id, content=emit_txt, role="assistant")
                                 role_sent = True
                             else:
-                                yield _openai_chunk(proxy_id, content=evt.data)
+                                yield _openai_chunk(proxy_id, content=emit_txt)
                     elif evt.type == "tool_calls":
+                        had_tool = True
+                        if pending_scrub:
+                            residue = strip_done(pending_scrub)
+                            pending_scrub = ""
+                            if residue:
+                                yield _openai_chunk(proxy_id, content=residue)
                         for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
+                            yield chunk
+
+                if had_tool:
+                    _record_turn()
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # Fallback: parse full buffer
+                if not had_tool and full_buf:
+                    tc_result, _ = parse_dsml_tool_calls(full_buf, tool_names)
+                    if tc_result:
+                        if not role_sent:
+                            if thinking_mode:
+                                yield _openai_chunk(proxy_id, reasoning_content="")
+                            role_sent = True
+                        for chunk in _emit_tool_calls_chunks(tc_result, proxy_id):
                             yield chunk
                         _record_turn()
                         yield "data: [DONE]\n\n"
                         return
 
-            # Flush sieve
-            had_tool = False
-            for evt in sieve.flush():
-                if evt.type == "text" and evt.data:
-                    completion_parts.append(evt.data)
+                # Text-only round: [done] ends the turn; without one (and
+                # with tools present) keep asking, up to the cap.
+                if not tool_names or rnd > limit or DONE_RE.search(full_buf):
+                    break
+                parent_cur = ro.get("response_message_id")
+                if parent_cur is None:
+                    break
+
+            if pending_scrub:
+                residue = strip_done(pending_scrub)
+                if residue:
                     if not role_sent:
-                        if thinking_mode:
-                            yield _openai_chunk(proxy_id, reasoning_content="")
-                        yield _openai_chunk(proxy_id, content=evt.data, role="assistant")
+                        yield _openai_chunk(proxy_id, content=residue, role="assistant")
                         role_sent = True
                     else:
-                        yield _openai_chunk(proxy_id, content=evt.data)
-                elif evt.type == "tool_calls":
-                    had_tool = True
-                    for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
-                        yield chunk
-
-            if had_tool:
-                _record_turn()
-                yield "data: [DONE]\n\n"
-                return
-
-            # Fallback: parse full buffer
-            if not had_tool and full_buf:
-                tc_result, _ = parse_dsml_tool_calls(full_buf, tool_names)
-                if tc_result:
-                    if not role_sent:
-                        if thinking_mode:
-                            yield _openai_chunk(proxy_id, reasoning_content="")
-                        role_sent = True
-                    for chunk in _emit_tool_calls_chunks(tc_result, proxy_id):
-                        yield chunk
-                    _record_turn()
-                    yield "data: [DONE]\n\n"
-                    return
-
+                        yield _openai_chunk(proxy_id, content=residue)
             _record_turn()
             yield _openai_chunk(proxy_id, finish=True)
             yield "data: [DONE]\n\n"

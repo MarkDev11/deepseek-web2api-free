@@ -238,7 +238,7 @@ _stats = StatsSnapshot()
 _pool = AccountPool()
 
 # Kept in sync with server.app.version by tests/test_admin_env.py.
-SERVER_VERSION = "3.3.13"
+SERVER_VERSION = "3.3.14"
 
 
 def get_pool() -> AccountPool:
@@ -521,6 +521,69 @@ async def add_account(req: AccountAddRequest, request: Request):
         token, cookies = parse_credential_blob(req.raw, token, cookies)
     try:
         acct = pool.add(token=token, cookies=cookies, email=req.email or "")
+    except Exception as e:
+        _pool_error(e)
+    return {"ok": True, "account": acct.to_dict()}
+
+
+def capture_login_credentials(run=None, store_path=None):
+    """OAuth-like capture: run the dsh-plugin login popup and return the
+    freshly captured credentials from the plugin store.
+
+    Same flow the plugin itself uses (browser window on chat.deepseek.com,
+    token + cookies grabbed from the live session). Only available when the
+    server runs locally with node on PATH; on Vercel there is no browser, so
+    the panel's Quick import remains the way there.
+    """
+    import json
+    import os
+    import shutil
+    import subprocess
+
+    repo = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(repo, "dsh-plugin", "scripts", "login.mjs")
+    store = store_path or os.path.join(os.path.expanduser("~"), ".dsh", "dsweb-accounts.json")
+    if os.environ.get("VERCEL") or not os.path.exists(script):
+        return {"ok": False, "status": 400,
+                "error": "browser login hanya tersedia saat server dijalankan lokal; di Vercel pakai Quick import"}
+    node = shutil.which("node")
+    if not node:
+        return {"ok": False, "status": 400, "error": "node tidak ditemukan di PATH (dibutuhkan untuk jendela login)"}
+    try:
+        proc = (run or subprocess.run)([node, script], capture_output=True, text=True, timeout=300)
+    except Exception as e:
+        return {"ok": False, "status": 502, "error": f"login gagal: {e}"}
+    if getattr(proc, "returncode", 1) != 0:
+        err = (getattr(proc, "stderr", "") or "").strip()[-300:]
+        return {"ok": False, "status": 502, "error": f"login gagal: {err or 'skrip login keluar non-nol'}"}
+    try:
+        with open(store, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        accounts = data.get("accounts") or []
+        if not accounts:
+            return {"ok": False, "status": 502, "error": "store login kosong"}
+        latest = accounts[-1]
+        if not latest.get("token"):
+            return {"ok": False, "status": 502, "error": "akun hasil login tidak memiliki token"}
+        return {"ok": True, "token": latest["token"],
+                "cookies": latest.get("cookies", ""), "email": latest.get("email", "")}
+    except FileNotFoundError:
+        return {"ok": False, "status": 502, "error": "file store login tidak ditemukan: " + store}
+    except Exception as e:
+        return {"ok": False, "status": 502, "error": f"baca store login gagal: {e}"}
+
+
+@router.post("/accounts/browser-login")
+async def account_browser_login(request: Request):
+    _check_auth(request)
+    pool = get_pool()
+    result = capture_login_credentials()
+    if not result.get("ok"):
+        raise HTTPException(status_code=result.get("status", 400),
+                            detail=result.get("error", "browser login gagal"))
+    try:
+        acct = pool.add(token=result["token"], cookies=result.get("cookies", ""),
+                        email=result.get("email", ""))
     except Exception as e:
         _pool_error(e)
     return {"ok": True, "account": acct.to_dict()}

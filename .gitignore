@@ -23,3 +23,8 @@ webui-new/.vite/
 *.egg-info/
 .vercel
 .env*
+
+# Local noise (debug log arsip, gh state, bridge eksperimen lama)
+dsweb-debug*.log
+.local/
+dsh-plugin-bridge/
