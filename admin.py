@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 import credential_store
 import account_pool as account_pool
-from credentials import parse_credential_blob
+from credentials import merge_cookie_blobs, parse_credential_blob
 from account_pool import AccountPool
 from crypto import is_enabled as crypto_is_enabled, _resolve_key
 from ip_utils import get_real_client_ip, is_trusted_proxy
@@ -524,6 +524,99 @@ async def add_account(req: AccountAddRequest, request: Request):
     except Exception as e:
         _pool_error(e)
     return {"ok": True, "account": acct.to_dict()}
+
+
+# ── Browser-capture (bookmarklet) ─────────────────────────────────
+# The hosted panel cannot open a browser on the server, and nothing may be
+# installed on the user's machine either - so the browser delivers its own
+# credentials: a bookmarklet runs in a LOGGED-IN chat.deepseek.com tab
+# (same-origin there, so userToken and the visible cookies are readable)
+# and POSTs the blob to this endpoint. Works for any number of users, no
+# install, nothing local. The secret is an HMAC over a fixed salt keyed by
+# secrets the deployment already has (ADMIN_TOKEN_SECRET, else
+# DEEPSEEK_ENCRYPTION_KEY): stable across restarts and instances, no new
+# env var, and it only ever leaves the server to an AUTHENTICATED panel
+# session via GET /capture-code (never on the login page).
+_CAPTURE_SALT = b"dsweb-capture-v1"
+_CAPTURE_WINDOW = 60.0
+_CAPTURE_MAX = 10
+_capture_attempts: dict[str, list[float]] = {}
+_capture_lock = threading.Lock()
+
+
+def _capture_secret() -> str:
+    base = _TOKEN_SECRET or os.environ.get("DEEPSEEK_ENCRYPTION_KEY", "").strip().encode()
+    if not base:
+        return ""
+    return hmac.new(base, _CAPTURE_SALT, hashlib.sha256).hexdigest()[:40]
+
+
+class CaptureRequest(BaseModel):
+    raw: str
+    secret: str
+    email: str | None = ""
+
+
+@router.get("/capture-code")
+async def capture_code(request: Request):
+    _check_auth(request)
+    secret = _capture_secret()
+    return {"enabled": bool(secret), "secret": secret}
+
+
+@router.post("/capture")
+async def capture(req: CaptureRequest, request: Request, response: Response):
+    """Public one-click capture (no admin session): bookmarklet -> pool."""
+    secret = _capture_secret()
+    if not secret:
+        raise HTTPException(status_code=503,
+                            detail="capture disabled: set ADMIN_TOKEN_SECRET or DEEPSEEK_ENCRYPTION_KEY")
+    if not hmac.compare_digest(secret, (req.secret or "").strip()[:128]):
+        raise HTTPException(status_code=401, detail="bad capture secret")
+    now = time.time()
+    ip = _client_ip(request)
+    with _capture_lock:
+        attempts = [t for t in _capture_attempts.get(ip, []) if now - t < _CAPTURE_WINDOW]
+        if len(attempts) >= _CAPTURE_MAX:
+            raise HTTPException(status_code=429, detail="too many captures, wait a minute")
+        attempts.append(now)
+        _capture_attempts[ip] = attempts
+    raw = (req.raw or "").strip()
+    if not raw or len(raw) > 16384:
+        raise HTTPException(status_code=400, detail="empty or oversized payload")
+    token, cookies = parse_credential_blob(raw, "", "")
+    if not token or not cookies:
+        raise HTTPException(status_code=400, detail="token and cookies could not be read from the payload")
+    pool = get_pool()
+    # Same token already in the pool = a known account re-logging in:
+    # rotate its cookies, never create a duplicate entry.
+    existing = pool.find_by_token(token)
+    if existing is not None:
+        # Same-name merge (like the PUT path): document.cookie cannot see
+        # HttpOnly values such as ds_session_id, so a recapture must never
+        # wipe them - only names present in the new blob are refreshed.
+        cookies = merge_cookie_blobs(existing.cookies, cookies)
+        if cookies != existing.cookies:
+            try:
+                pool.update(existing.id, cookies=cookies)
+            except Exception as e:
+                _pool_error(e)
+        acct = pool.get_by_id(existing.id) or existing
+        updated = True
+    else:
+        try:
+            acct = pool.add(token=token, cookies=cookies, email=(req.email or "").strip())
+        except Exception as e:
+            _pool_error(e)
+        updated = False
+    # The bookmarklet runs on the chat.deepseek.com origin and the CORS
+    # middleware stays strict by default - so this endpoint carries its own
+    # Access-Control-Allow-Origin. The bookmarklet sends text/plain (a
+    # "simple" POST), so there is no preflight either.
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return {"ok": True, "updated": updated, "account": acct.to_dict()}
+
+
 
 
 def capture_login_credentials(run=None, store_path=None):

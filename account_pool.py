@@ -375,6 +375,18 @@ class AccountPool:
         with self._lock:
             return next((a for a in self._accounts if a.id == account_id), None)
 
+    def find_by_token(self, token: str) -> Optional[Account]:
+        """The account currently holding this exact token.
+
+        Used by the bookmarklet capture: same token = the same account
+        re-logged in, so its cookies are rotated instead of duplicating.
+        """
+        token = (token or "").strip()
+        if not token:
+            return None
+        with self._lock:
+            return next((a for a in self._accounts if a.token == token), None)
+
     def update(self, account_id: str, token: str | None = None,
                cookies: str | None = None, email: str | None = None) -> Account:
         with self._lock:
