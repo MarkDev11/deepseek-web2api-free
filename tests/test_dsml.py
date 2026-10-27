@@ -144,3 +144,62 @@ def test_parse_dsml_tool_calls_handles_cdata_escapes():
     # just verify it doesn't crash and returns the raw bytes.
     args = tcs[0]["function"]["arguments"]
     assert "a]]>b" in args
+
+
+# --- v3.3.20: bentuk longgar yang dulu bocor ( laporan user 2026-10-27 ) ---
+
+def test_parse_dsml_loose_alias_double_pipe_spaced():
+    q = "\uff5c\uff5c"
+    text = (
+        "<" + q + "DSML" + q + " calls> <" + q + "DSML" + q + " invoke name=\"read\">"
+        "<" + q + "DSML" + q + " parameter name=\"file_path\">src/cli.js</" + q + "DSML" + q + " parameter>"
+        "</" + q + "DSML" + q + " invoke></" + q + "DSML" + q + " calls>"
+    )
+    tcs, cleaned = parse_dsml_tool_calls(text, ["read"])
+    assert len(tcs) == 1
+    assert tcs[0]["function"]["name"] == "read"
+    assert "src/cli.js" in tcs[0]["function"]["arguments"]
+    assert "DSML" not in cleaned
+    assert "calls" not in cleaned
+
+
+def test_parse_dsml_function_calls_wrapper_fullwidth():
+    q = "\uff5c"
+    text = (
+        "<" + q + "DSML" + q + "function_calls>"
+        "<" + q + "DSML" + q + "invoke name=\"exec\">"
+        "<" + q + "DSML" + q + "parameter name=\"cmd\"><![CDATA[ls -la]]></" + q + "DSML" + q + "parameter>"
+        "</" + q + "DSML" + q + "invoke></" + q + "DSML" + q + "function_calls>"
+    )
+    tcs, cleaned = parse_dsml_tool_calls(text, ["exec"])
+    assert len(tcs) == 1
+    assert "ls -la" in tcs[0]["function"]["arguments"]
+    assert "DSML" not in cleaned
+
+
+def test_parse_dsml_string_attr_keeps_params():
+    q = "\uff5c\uff5c"
+    text = (
+        "<" + q + "DSML" + q + " invoke name=\"read\">"
+        "<" + q + "DSML" + q + " parameter name=\"file_path\">src/cli.js</" + q + "DSML" + q + " parameter>"
+        "<" + q + "DSML" + q + " parameter name=\"offset\" string=\"false\">19</" + q + "DSML" + q + " parameter>"
+        "</" + q + "DSML" + q + " invoke>"
+    )
+    tcs, _ = parse_dsml_tool_calls(text, ["read"])
+    assert len(tcs) == 1
+    args = tcs[0]["function"]["arguments"]
+    assert "\"file_path\"" in args and "\"offset\"" in args
+    assert "19" in args
+
+
+def test_parse_dsml_bare_close_without_angle():
+    q = "\uff5c"
+    text = (
+        "<" + q + "DSML" + q + "invoke name=\"Pwsh\">"
+        "<" + q + "DSML" + q + "parameter name=\"command\">say hi" + q + "DSML" + q + "parameter>"
+        "</" + q + "DSML" + q + "invoke>"
+    )
+    tcs, cleaned = parse_dsml_tool_calls(text, ["Pwsh"])
+    assert len(tcs) == 1
+    assert "say hi" in tcs[0]["function"]["arguments"]
+    assert "DSML" not in cleaned

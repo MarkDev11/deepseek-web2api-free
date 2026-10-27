@@ -5,10 +5,10 @@ export const DSML_BLOCK_END = '</\uff5cDSML\uff5cfunction_calls>';
 
 // Pipe yang boleh muncul di tag model: fullwidth \uff5c, ASCII |, atau hilang sama sekali (varian model).
 const P = '[|\uff5c]';
-const LOOSE_OPEN_RE = new RegExp('<\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|function_calls)');
-const LOOSE_CLOSE_ANY_RE = new RegExp('<\\/\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(?:invoke|parameter|function_calls)\\s*>', 'gi');
+const LOOSE_OPEN_RE = new RegExp('<\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|tool_calls|tool_call|function_calls|calls)');
+const LOOSE_CLOSE_ANY_RE = new RegExp('<\\/\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(?:invoke|parameter|tool_calls|tool_call|function_calls|calls)\\s*>', 'gi');
 // Tag DSML apa pun (termasuk terpotong tanpa '>') untuk pembersihan teks:
-const TRUNC_ANY_RE = new RegExp('<\\/?\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(?:invoke|parameter|function_calls)[^>]*>?', 'gi');
+const TRUNC_ANY_RE = new RegExp('<\\/?\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(?:invoke|parameter|tool_calls|tool_call|function_calls|calls)[^>]*>?', 'gi');
 
 export function buildToolSystemPrompt(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return '';
@@ -32,10 +32,10 @@ export function buildToolSystemPrompt(tools) {
 export function normalizeDsml(text) {
   if (!text) return text;
   return text
-    .replace(new RegExp('(?<![<\\/｜|])\\/?\\s*' + P + '{1,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|function_calls)\\s*>', 'gi'), '</\uff5cDSML\uff5c$1>')
-    .replace(new RegExp('<\\/\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|function_calls)\\s*>', 'gi'), '</\uff5cDSML\uff5c$1>')
+    .replace(new RegExp('(?<![<\\/｜|])\\/?\\s*' + P + '{1,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|tool_calls|tool_call|function_calls|calls)\\s*>', 'gi'), '</\uff5cDSML\uff5c$1>')
+    .replace(new RegExp('<\\/\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|tool_calls|tool_call|function_calls|calls)\\s*>', 'gi'), '</\uff5cDSML\uff5c$1>')
     .replace(/<\/\s*(invoke|parameter)\s*>/gi, '</\uff5cDSML\uff5c$1>')
-    .replace(new RegExp('<\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|function_calls)', 'gi'), '<\uff5cDSML\uff5c$1')
+    .replace(new RegExp('<\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(invoke|parameter|tool_calls|tool_call|function_calls|calls)', 'gi'), '<\uff5cDSML\uff5c$1')
     .replace(/<\/\uff5cDSML\uff5c\s+/g, '</\uff5cDSML\uff5c')
     .replace(/<\uff5cDSML\uff5c\s+/g, '<\uff5cDSML\uff5c');
 }
@@ -46,13 +46,17 @@ export function parseDsmlToolCalls(text) {
   if (norm.indexOf('<\uff5cDSML\uff5c') === -1) return [];
   const calls = [];
   const invokeRe = /<\uff5cDSML\uff5cinvoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/\uff5cDSML\uff5cinvoke>/g;
-  const paramRe = /<\uff5cDSML\uff5cparameter\s+name="([^"]+)"(?:\s+string="(?:true|false)")?\s*>([\s\S]*?)<\/\uff5cDSML\uff5cparameter>/g;
+  const paramRe = /<\uff5cDSML\uff5cparameter\s+name="([^"]+)"(?:\s+[\w-]+="[^"]*")*\s*>([\s\S]*?)<\/\uff5cDSML\uff5cparameter>/g;
   let m;
   while ((m = invokeRe.exec(norm)) !== null) {
     const args = {};
     let pm;
     paramRe.lastIndex = 0;
-    while ((pm = paramRe.exec(m[2])) !== null) args[pm[1]] = pm[2].replace(TRUNC_ANY_RE, '');
+    while ((pm = paramRe.exec(m[2])) !== null) {
+      let v = pm[2].replace(TRUNC_ANY_RE, '');
+      if (v.startsWith('<![CDATA[') && v.endsWith(']]>')) v = v.slice(9, -3); // v3.3.20: selubung CDATA
+      args[pm[1]] = v;
+    }
     calls.push({ id: 'call_' + crypto.randomBytes(8).toString('hex'), name: m[1], arguments: JSON.stringify(args), parsedArguments: args });
   }
   return calls;
@@ -77,7 +81,7 @@ export class DsmlStreamSieve {
         out.text += this.buffer.slice(0, m.index).replace(TRUNC_ANY_RE, '');
         this.buffer = this.buffer.slice(m.index);
         if (m.index + m[0].length >= this.buffer.length) break;
-        this.inDsml = true; this.dsmlBuffer = ''; this.expectFc = m[1] === 'function_calls';
+        this.inDsml = true; this.dsmlBuffer = ''; this.expectFc = /^(tool_calls|tool_call|function_calls|calls)$/.test(m[1]);
         continue;
       }
       this.dsmlBuffer += this.buffer; this.buffer = '';
@@ -89,10 +93,10 @@ export class DsmlStreamSieve {
       const closeRe = /<\/\s*(?:(?:[|\uff5c]{0,2}\s*DSML\s*[|\uff5c]{0,2}\s*)?)invoke\s*>/g;
       let lastClose = -1, cc = 0, cm;
       while ((cm = closeRe.exec(raw)) !== null) { lastClose = cm.index + cm[0].length; cc++; }
-      const fcRe = new RegExp('<\\/\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*function_calls\\s*>', 'g');
+      const fcRe = new RegExp('<\\/\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(?:function_calls|tool_calls|tool_call|calls)\\s*>', 'g');
       let fcEnd = -1, fm;
       while ((fm = fcRe.exec(raw)) !== null) fcEnd = fm.index + fm[0].length;
-      const wrapped = this.expectFc || new RegExp('<\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*function_calls').test(raw);
+      const wrapped = this.expectFc || new RegExp('<\\s*' + P + '{0,2}\\s*DSML\\s*' + P + '{0,2}\\s*(?:function_calls|tool_calls|tool_call|calls)').test(raw);
       const complete = fcEnd !== -1 || (opens > 0 && cc >= opens && !wrapped);
       if (!complete) break;
       const cut = Math.max(lastClose, fcEnd);

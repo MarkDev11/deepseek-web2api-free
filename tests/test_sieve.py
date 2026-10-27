@@ -129,3 +129,55 @@ def test_tokenized_dsml_tool_call_leaks_no_text():
 def test_lone_lt_and_pipe_in_plain_text_pass_through():
     s = StreamSieve(parse_fn=_parse_fn_stub)
     assert _collect_text(s, ["a < b", " | c"]) == "a < b | c"
+
+
+# --- v3.3.20: tag longgar tidak boleh bocor ke teks ---
+
+def test_loose_tags_streamed_never_leak_dsml():
+    from tool_dsml import parse_dsml_tool_calls
+    q = "\uff5c\uff5c"
+    raw = (
+        "Tahu. <" + q + "DSML" + q + " calls> <" + q + "DSML" + q + " invoke name=\"read\">"
+        "<" + q + "DSML" + q + " parameter name=\"file_path\">src/cli.js</" + q + "DSML" + q + " parameter>"
+        "</" + q + "DSML" + q + " invoke></" + q + "DSML" + q + " calls> selesai"
+    )
+    s = StreamSieve(parse_fn=lambda t: parse_dsml_tool_calls(t, ["read"]))
+    text, calls = _collect(s, [raw[i:i + 7] for i in range(0, len(raw), 7)])
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "read"
+    assert "DSML" not in text
+    assert "calls" not in text
+    assert text.startswith("Tahu.")
+    assert "selesai" in text
+
+
+def test_string_attr_param_survives_sieve():
+    from tool_dsml import parse_dsml_tool_calls
+    raw = ('<|DSML|invoke name="get_weather"><|DSML|parameter name="city" string="true">Berlin</|DSML|parameter></|DSML|invoke>')
+    s = StreamSieve(parse_fn=lambda t: parse_dsml_tool_calls(t, ["get_weather"]))
+    text, calls = _collect(s, [raw[i:i + 5] for i in range(0, len(raw), 5)])
+    assert len(calls) == 1
+    assert "Berlin" in calls[0]["function"]["arguments"]
+
+
+def test_flush_strips_markers_when_never_closed():
+    from tool_dsml import parse_dsml_tool_calls
+    q = "\uff5c"
+    raw = ("Oke " + "<" + q + "DSML" + q + "invoke name=\"f\"><" + q + "DSML" + q + "parameter name=\"x\">1</" + q + "DSML" + q + "parameter>")
+    s = StreamSieve(parse_fn=lambda t: parse_dsml_tool_calls(t, ["f"]))
+    text, calls = _collect(s, [raw])
+    assert "DSML" not in text
+    assert text.startswith("Oke ")
+
+
+def test_flush_recovers_unclosed_wrapper():
+    from tool_dsml import parse_dsml_tool_calls
+    q = "\uff5c"
+    raw = ("<" + q + "DSML" + q + "tool_calls><" + q + "DSML" + q + "invoke name=\"f\">"
+           "<" + q + "DSML" + q + "parameter name=\"x\">42</" + q + "DSML" + q + "parameter>"
+           "</" + q + "DSML" + q + "invoke>")  # wrapper lupa ditutup
+    s = StreamSieve(parse_fn=lambda t: parse_dsml_tool_calls(t, ["f"]))
+    text, calls = _collect(s, [raw])
+    assert len(calls) == 1
+    assert "42" in calls[0]["function"]["arguments"]
+    assert "DSML" not in text

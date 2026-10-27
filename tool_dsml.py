@@ -16,11 +16,59 @@ from typing import Any
 _CDATA_OPEN = "<![CDATA["
 _CDATA_CLOSE = "]]>"
 
+# --- Parser longgar (v3.3.20, disejajarkan dengan dsh-plugin/src/dsml.js) ---
+# Model (dan prompt pihak ketiga) menghasilkan varian tag: pipa fullwidth ｜,
+# pipa ASCII |, pipa hilang, spasi di dalam tag, wrapper bernama function_calls
+# atau calls, serta penutup parameter tanpa '<' ("nilai｜DSML｜parameter>").
+# Semua varian dilipat ke bentuk kanonik '<|DSML|name …>' sebelum diparse.
+_PIPE = r"[|\uff5c]"
+_TAG_NAMES = r"tool_calls|tool_call|function_calls|calls|invoke|parameter"
+_LOOSE_TAG_RE = re.compile(
+    r"<\s*(/?)\s*" + _PIPE + r"{0,2}\s*DSML\s*" + _PIPE + r"{0,2}\s*(" + _TAG_NAMES + r")([^>]*)>",
+    re.IGNORECASE,
+)
+_BARE_CLOSE_RE = re.compile(
+    r"(?<![</|\uff5c])/?\s*" + _PIPE + r"{1,2}\s*DSML\s*" + _PIPE + r"{0,2}\s*(" + _TAG_NAMES + r")\s*>",
+    re.IGNORECASE,
+)
+_TRUNC_TAG_RE = re.compile(
+    r"(?:</?\s*" + _PIPE + r"{0,2}\s*DSML\s*" + _PIPE + r"{0,2}|(?<![</|\uff5c])/?\s*" + _PIPE + r"{1,2}\s*DSML\s*" + _PIPE + r"{0,2})"
+    r"\s*(?:" + _TAG_NAMES + r")(?:[^>\"']|\"[^\"]*\"|'[^']*')*>?",
+    re.IGNORECASE,
+)
+
+
+def _canonical_name(name: str) -> str:
+    low = name.lower()
+    if low in ("function_calls", "calls"):
+        return "tool_calls"
+    return low
+
+
+def normalize_dsml(text: str) -> str:
+    """Lipat semua varian tag DSML ke bentuk kanonik '<|DSML|name ...>'.
+
+    Alias wrapper function_calls/calls menjadi tool_calls; pipa apa pun
+    (｜, |, atau tanpa pipa) dinormalisasi; spasi di dalam tag dibuang;
+    penutup tanpa '<' diberi bentuk lengkapnya. Idempoten.
+    """
+    if not text or "dsml" not in text.lower():
+        return text
+    text = _BARE_CLOSE_RE.sub(lambda m: "</|DSML|" + _canonical_name(m.group(1)) + ">", text)
+    text = _LOOSE_TAG_RE.sub(
+        lambda m: ("<" if not m.group(1) else "</") + "|DSML|" + _canonical_name(m.group(2)) + m.group(3) + ">",
+        text,
+    )
+    return text
+
+
+
 
 def strip_dsml_markup(text: str) -> str:
     """去除 DSML 前缀，保留原始 XML 结构。"""
     if not text:
         return text
+    text = normalize_dsml(text)
     parts = []
     i, n = 0, len(text)
     while i < n:
@@ -48,7 +96,7 @@ def strip_dsml_markup(text: str) -> str:
         dsml = False
         while j < len(rest):
             ch = rest[j]
-            if ch in ('|', ' ', '\t', '\r', '\n'):
+            if ch in ('|', '\uff5c', ' ', '\t', '\r', '\n'):
                 j += 1
                 if ch == '|':
                     dsml = True
@@ -62,7 +110,7 @@ def strip_dsml_markup(text: str) -> str:
             while name_end < len(rest) and (rest[name_end].isalnum() or rest[name_end] == '_'):
                 name_end += 1
             tag_name = rest[j:name_end].lower()
-            if tag_name in ("tool_calls", "invoke", "parameter"):
+            if tag_name in ("tool_calls", "tool_call", "invoke", "parameter"):
                 prefix = '</' if inner.startswith('/') else '<'
                 parts.append(prefix + rest[j:] + '>')
                 i = end + 1
@@ -85,11 +133,17 @@ def parse_dsml_tool_calls(text: str, tool_names: list[str] | None = None) -> tup
     if not text:
         return [], text
 
+    text = normalize_dsml(text)
     normalized = strip_dsml_markup(text)
     tool_calls = []
 
     # <tool_calls>...</tool_calls> 或 <tool_call>...</tool_call>
-    for pattern in (r"<tool_calls>(.*?)</tool_calls>", r"<tool_call>(.*?)</tool_call>"):
+    for pattern in (
+        r"<tool_calls>(.*?)</tool_calls>",
+        r"<tool_call>(.*?)</tool_call>",
+        r"<function_calls>(.*?)</function_calls>",
+        r"<calls>(.*?)</calls>",
+    ):
         blocks = re.findall(pattern, normalized, re.DOTALL | re.IGNORECASE)
         if blocks:
             break
@@ -121,7 +175,7 @@ def parse_dsml_tool_calls(text: str, tool_names: list[str] | None = None) -> tup
 def _parse_parameters(inner_text: str) -> dict:
     args = {}
     for m in re.finditer(
-        r"<parameter\s+name=[\"']([^\"']+)[\"']>(.*?)</parameter>",
+        r"<parameter\s+name=[\"']([^\"']+)[\"'](?:\s+[a-zA-Z_][A-Za-z0-9_-]*=\"[^\"]*\")*>(.*?)</parameter>",
         inner_text, re.DOTALL | re.IGNORECASE
     ):
         key = m.group(1).strip()
@@ -157,9 +211,13 @@ def _format_tool_call(name: str, args: dict) -> dict | None:
 
 
 def _clean_dsml_text(text: str) -> str:
-    text = re.sub(r"<tool_calls?>.*?</tool_calls?>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(
+        r"<(?:tool_calls|tool_call|function_calls|calls)>.*?</(?:tool_calls|tool_call|function_calls|calls)>",
+        "", text, flags=re.DOTALL | re.IGNORECASE,
+    )
     text = re.sub(r"<invoke[^>]*>.*?</invoke>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<parameter[^>]*>.*?</parameter>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = _TRUNC_TAG_RE.sub("", text)
     text = re.sub(r"<!\[CDATA\[.*?\]\]>", "", text, flags=re.DOTALL)
     text = re.sub(r"\[citation:\d+\]", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
